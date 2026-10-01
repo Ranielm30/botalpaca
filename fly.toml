@@ -1,0 +1,64 @@
+# botalpaca — Fly.io deployment.
+#
+# One long-running machine: the Telegram bot plus the background scheduler
+# (market monitor, position monitor, reconciliation) live in the same process,
+# so there is a single writer to the SQLite database on the persistent volume.
+#
+# IMPORTANT: never put secrets in this file. Set them with:
+#   fly secrets set TELEGRAM_BOT_TOKEN=... ALPACA_PAPER_API_KEY=...
+#
+# A persistent volume is MANDATORY: without it every machine replacement wipes
+# the trade journal, the order audit trail, the kill-switch state and the
+# position-protection rows.
+
+app = "botalpaca"
+primary_region = "iad"
+
+# ----------------------------------------------------------------- build
+[build]
+  dockerfile = "Dockerfile"
+
+# ----------------------------------------------------------------- runtime
+# The image already carries the same defaults; they are repeated here so the
+# deployed configuration is readable in one place. Secrets live in `fly secrets`.
+[env]
+  TZ = "America/New_York"
+  LOG_LEVEL = "INFO"
+  LOG_JSON = "true"
+  DATA_DIR = "/data"
+  DATABASE_URL = "sqlite+aiosqlite:////data/botalpaca.db"
+  DATABASE_MIGRATE = "true"
+  DATABASE_AUTO_CREATE = "false"
+  # PAPER is the startup default. Moving to REAL is a deliberate, confirmed
+  # Telegram action (/modo), never an automatic restart behaviour.
+  ACTIVE_TRADING_ENVIRONMENT = "PAPER"
+  SCAN_INTERVAL_SECONDS = "300"
+  MONITOR_INTERVAL_SECONDS = "60"
+  RECONCILE_INTERVAL_SECONDS = "300"
+
+# ----------------------------------------------------------------- process
+[processes]
+  bot = "python -m botalpaca"
+
+# ----------------------------------------------------------------- machine
+[deploy]
+  # The scanner and the protection manager must be running whenever the market
+  # is open, so the machine is never scaled to zero.
+  min_machines_running = 1
+  strategy = "rolling"
+
+[vm]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+# ----------------------------------------------------------------- storage
+[[mounts]]
+  source = "botalpaca_data"
+  destination = "/data"
+
+# NOTE: this service publishes no HTTP port on purpose. Everything is reached
+# through Telegram's allowlisted user IDs, so there is nothing to expose and
+# nothing to health-check over HTTP. Liveness is handled by the Docker
+# HEALTHCHECK in the image (`python -m botalpaca --check`, which authenticates
+# against the active environment and never sends an order) and by
+# `fly status` / `fly logs`.

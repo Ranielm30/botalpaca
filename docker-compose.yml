@@ -1,0 +1,38 @@
+# Local container stack for botalpaca.
+#
+# Secrets are never committed: copy `.env.example` to `.env` and fill it in.
+# The SQLite file lives in a named volume so the journal, the audit trail and
+# the protection state survive `docker compose down`.
+
+services:
+  bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: botalpaca:local
+    container_name: botalpaca
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      TZ: ${TZ:-America/New_York}
+      DATA_DIR: /data
+      DATABASE_URL: sqlite+aiosqlite:////data/botalpaca.db
+      DATABASE_MIGRATE: "true"
+      DATABASE_AUTO_CREATE: "false"
+      # PAPER by default. Switch to REAL only from Telegram with /modo.
+      ACTIVE_TRADING_ENVIRONMENT: ${ACTIVE_TRADING_ENVIRONMENT:-PAPER}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      LOG_JSON: ${LOG_JSON:-true}
+    volumes:
+      - botalpaca_data:/data
+    # No published ports: the bot is only reachable through Telegram.
+    healthcheck:
+      test: ["CMD", "/opt/venv/bin/python", "-m", "botalpaca", "--check"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 45s
+
+volumes:
+  botalpaca_data:

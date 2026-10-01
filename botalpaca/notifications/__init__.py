@@ -1,0 +1,39 @@
+"""Layer 15 — Notification engine."""
+
+from botalpaca.notifications.service import (
+    NotificationBudget,
+    NotificationService,
+    Sender,
+    bar,
+    env_badge,
+    money,
+    pct,
+    pct_auto,
+    render_account,
+    render_opportunity,
+    render_orders,
+    render_position_alert,
+    render_positions,
+    render_real_warning,
+    render_summary,
+    render_trade_plan,
+)
+
+__all__ = [
+    "NotificationBudget",
+    "NotificationService",
+    "Sender",
+    "bar",
+    "env_badge",
+    "money",
+    "pct",
+    "pct_auto",
+    "render_account",
+    "render_opportunity",
+    "render_orders",
+    "render_position_alert",
+    "render_positions",
+    "render_real_warning",
+    "render_summary",
+    "render_trade_plan",
+]

@@ -1,0 +1,77 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "botalpaca"
+version = "1.0.0"
+description = "Professional Telegram trading assistant for Alpaca (paper/live isolated)"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [{ name = "Ranielm30" }]
+dependencies = [
+    "alpaca-py==0.44.0",
+    "python-telegram-bot>=21.10",
+    "SQLAlchemy>=2.0.36",
+    "alembic>=1.14",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "httpx>=0.27",
+    "pandas>=2.2",
+    "numpy>=2.1",
+    "structlog>=24.4",
+    "tenacity>=9.0",
+    "apscheduler>=3.10",
+    "orjson>=3.10",
+    "tzdata",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=6.0",
+    "respx>=0.22",
+    "ruff>=0.8",
+    "mypy>=1.13",
+    "aiosqlite>=0.20",
+]
+
+[project.scripts]
+botalpaca = "botalpaca.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["botalpaca*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-q --strict-markers"
+asyncio_mode = "auto"
+filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "W"]
+# E501: long Spanish user-facing lines are fine.
+# B008: pydantic-settings uses Field(default_factory=...) calls by design.
+# UP042: domain/enums.py defines its own StrEnum shim so the project still runs
+#        on Python 3.11, where enum.StrEnum does not exist yet.
+# E741: indicators/core.py uses `l` for level lists in the math helpers.
+ignore = ["E501", "B008", "UP042", "E741"]
+
+[tool.ruff.lint.per-file-ignores]
+# Test doubles intentionally define locals/attributes that only exist to prove a
+# method is not reached, and one test asserts a broad exception class.
+"tests/*" = ["B017", "F841"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_configs = true
+ignore_missing_imports = true
