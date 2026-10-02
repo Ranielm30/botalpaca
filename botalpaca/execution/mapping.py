@@ -104,6 +104,7 @@ def to_order_state(raw: Any, environment: TradingEnvironment) -> OrderState:
     for leg in getattr(raw, "legs", None) or []:
         legs.append(
             OrderLeg(
+                id=str(getattr(leg, "id", "") or "") or None,
                 symbol=str(getattr(leg, "symbol", "")).upper(),
                 qty=float(getattr(leg, "qty", 0.0) or 0.0),
                 side=_enum_value(getattr(leg, "side", "buy"), "buy"),  # type: ignore[arg-type]

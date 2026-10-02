@@ -369,6 +369,9 @@ class PositionSnapshot(Domain):
 
 
 class OrderLeg(Domain):
+    # Alpaca does assign an id to each bracket/OCO child, and the protection
+    # manager needs it to record which order actually carries the stop.
+    id: str | None = None
     symbol: str
     qty: float
     side: OrderSide
