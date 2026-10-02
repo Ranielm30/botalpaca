@@ -16,11 +16,12 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 from botalpaca.config import MonitoringSettings, ProtectionSettings, get_settings
 from botalpaca.config.logging import get_logger
-from botalpaca.db import AppStateRepository, Database
+from botalpaca.db import AppStateRepository, Database, TradeRepository
 from botalpaca.domain import (
     ExitReason,
     HealthStatus,
@@ -43,19 +44,35 @@ SCORE_PREFIX = "position_score:"
 
 @dataclass
 class PositionAlert:
-    """A scored explanation of what deteriorated on an open position."""
+    """Something the operator needs to know about an open or pending trade.
+
+    Two shapes share this record. A ``deterioration`` explains why a position
+    lost score. A ``fill`` announces that an entry queued outside market hours
+    finally executed, carrying the price Alpaca actually paid and the levels now
+    protecting it.
+    """
 
     symbol: str
     environment: TradingEnvironment
-    previous_score: float
-    current_score: float
+    previous_score: float = 0.0
+    current_score: float = 0.0
     changes: list[str] = field(default_factory=list)
     position: PositionSnapshot | None = None
     exit_rule_triggered: str | None = None
+    kind: str = "deterioration"
+    filled_at: dt.datetime | None = None
+    fill_price: float | None = None
+    stop_price: float | None = None
+    target_price: float | None = None
+    qty: float | None = None
 
     @property
     def drop(self) -> float:
         return self.previous_score - self.current_score
+
+    @property
+    def is_fill(self) -> bool:
+        return self.kind == "fill"
 
 
 class MarketMonitor:
@@ -191,7 +208,9 @@ class PositionMonitor:
     async def check_all(self) -> list[PositionAlert]:
         """Re-analyse every open position and report the changes."""
         positions = await self._portfolio.get_positions()  # type: ignore[attr-defined]
-        alerts: list[PositionAlert] = []
+        # Fills first: an entry that executed while we were not looking is the
+        # one thing the operator cannot see anywhere else.
+        alerts: list[PositionAlert] = list(await self.check_fills(positions))
         for position in positions:
             if position.qty == 0:
                 continue
@@ -204,6 +223,76 @@ class PositionMonitor:
             if alert is not None:
                 alerts.append(alert)
         return alerts
+
+    async def check_fills(
+        self, positions: Sequence[PositionSnapshot]
+    ) -> list[PositionAlert]:
+        """Announce entries that Alpaca filled while we were waiting.
+
+        An order sent with the market closed stays ``accepted`` until the open,
+        so the position only shows up afterwards. Without this the operator finds
+        a position they were never told about.
+        """
+        alerts: list[PositionAlert] = []
+        async with self._db.session() as session:
+            repo = TradeRepository(session)
+            pending = await repo.get_pending(self.environment)
+            live = {p.symbol.upper(): p for p in positions}
+            for row in pending:
+                symbol = row.symbol.upper()
+                # The row's own filled_at is the authority for "has this already
+                # been announced", not whether a position shows up.
+                if row.filled_at is not None:
+                    continue
+                position = live.get(symbol)
+                if position is None or not position.qty:
+                    # Alpaca creates the position the instant the parent order
+                    # fills, so its absence means the entry has NOT executed.
+                    # Announcing here would tell the operator the trade is open
+                    # while the order is still sitting in the queue.
+                    continue
+                filled_price = self._fill_price(row, positions)
+                marked = await repo.mark_filled(
+                    row.id,
+                    self.environment,
+                    filled_at=dt.datetime.now(dt.UTC),
+                    entry_price=filled_price,
+                )
+                if not marked:
+                    continue
+                log.info(
+                    "position.filled",
+                    environment=self.environment.value,
+                    symbol=symbol,
+                    qty=row.qty,
+                    price=filled_price,
+                )
+                alerts.append(
+                    PositionAlert(
+                        kind="fill",
+                        symbol=symbol,
+                        environment=self.environment,
+                        filled_at=dt.datetime.now(dt.UTC),
+                        fill_price=filled_price,
+                        stop_price=row.stop_price,
+                        target_price=row.target_price,
+                        qty=row.qty,
+                        position=position,
+                        changes=["La entrada se ejecuto al abrir el mercado"],
+                    )
+                )
+        return alerts
+
+    def _fill_price(self, row: object, positions: Sequence[PositionSnapshot]) -> float:
+        """What was actually paid, preferring the live position's average.
+
+        A gap at the open is normal, so Alpaca's average entry beats the price
+        we planned against last night's close.
+        """
+        for position in positions:
+            if position.symbol.upper() == row.symbol.upper() and position.avg_entry_price:
+                return round(float(position.avg_entry_price), 2)
+        return round(float(row.entry_price or 0.0), 2)
 
     async def check_position(self, position: PositionSnapshot) -> PositionAlert | None:
         """Compare the current technicals against the score stored at entry."""

@@ -300,6 +300,21 @@ def _entry_reference(
     return 0.0
 
 
+def _order_filled(order: OrderState | None) -> bool:
+    """Whether Alpaca already executed the entry.
+
+    Only a real fill price counts. ``filled_qty`` is unreliable across the SDK
+    versions this runs on, but ``filled_avg_price`` is only ever populated once
+    there is an actual fill.
+    """
+    if order is None:
+        return False
+    return bool(order.filled_avg_price) or order.status in _FILLED_STATUSES
+
+
+_FILLED_STATUSES = frozenset({"filled", "partially_filled"})
+
+
 class Application:
     """Process-level container: database, security, environments, services."""
 
@@ -553,6 +568,12 @@ class Application:
 
         entry_price = _entry_reference(plan, order, opportunity)
 
+        # An order sent while the market is shut stays accepted and fills at the
+        # open. Recording that honestly lets the operator see the entry as
+        # PENDING and lets the monitor announce the fill instead of it
+        # materialising without warning.
+        filled_at = dt.datetime.now(dt.UTC) if _order_filled(order) else None
+
         state = await self.protection.register_entry_protection(
             environment=environment,
             symbol=plan.symbol,
@@ -592,6 +613,7 @@ class Application:
             stop_order_id=state.stop_order_id,
             take_profit_order_id=state.take_profit_order_id,
             time_stop_at=state.time_stop_at,
+            filled_at=filled_at,
         )
         return result
 

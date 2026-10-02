@@ -15,6 +15,7 @@ from typing import Any
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from botalpaca.config.logging import get_logger
+from botalpaca.db import TradeRepository
 from botalpaca.domain import (
     Opportunity,
     PositionSnapshot,
@@ -37,6 +38,7 @@ from botalpaca.notifications import (
     money,
     pct_auto,
     render_account,
+    render_fill,
     render_opportunity,
     render_orders,
     render_position_alert,
@@ -653,10 +655,14 @@ class TelegramFacade:
         await self.authorize(update)
         wanted = parse_symbol_list(args)
         positions = await self.app.portfolio.get_positions()
+        # Entries Alpaca is holding for the market open are not positions yet,
+        # but the operator has to see them or the order looks lost.
+        pending = await self._pending_entries()
         if wanted:
             targets = set(wanted)
             positions = [p for p in positions if p.symbol in targets]
-        if not positions:
+            pending = [r for r in pending if r.symbol.upper() in targets]
+        if not positions and not pending:
             return CommandResult(
                 render_positions([], self.environment),
                 kb.positions_picker_keyboard([], environment=self.environment),
@@ -670,9 +676,17 @@ class TelegramFacade:
 
         entries = [(p.symbol, p.unrealized_plpc) for p in positions]
         return CommandResult(
-            render_positions(positions, self.environment, protection=protection),
+            render_positions(
+                positions, self.environment, protection=protection, pending=pending
+            ),
             kb.positions_picker_keyboard(entries, environment=self.environment),
         )
+
+    async def _pending_entries(self) -> list[object]:
+        """Trades whose entry order has been accepted but not yet filled."""
+        async with self.app.database.session() as session:
+            rows = await TradeRepository(session).get_pending(self.environment)
+        return list(rows)
 
     async def position_menu(self, update: object, symbol: str) -> CommandResult:
         """Show one position in full, with the actions that apply to it."""
@@ -1603,6 +1617,11 @@ class TelegramFacade:
 
         for alert in alerts:
             position = alert.position
+            if getattr(alert, "is_fill", False):
+                # A fill is good news and needs no decision from the operator,
+                # so it goes out on its own instead of behind an action keyboard.
+                await self.app.notifications.send(render_fill(alert), force=True)
+                continue
             text = render_position_alert(
                 position,
                 previous_score=alert.previous_score,

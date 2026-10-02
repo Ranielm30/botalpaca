@@ -178,6 +178,7 @@ class TradeJournal:
         take_profit_order_id: str | None = None,
         time_stop_at: dt.datetime | None = None,
         metadata: dict[str, Any] | None = None,
+        filled_at: dt.datetime | None = None,
     ) -> TradeModel:
         async with self._db.session() as session:
             row = TradeModel(
@@ -209,6 +210,7 @@ class TradeJournal:
                 time_stop_at=time_stop_at,
                 metadata_json=metadata or {},
                 opened_at=dt.datetime.now(dt.UTC),
+                filled_at=filled_at,
             )
             session.add(row)
             await session.flush()
@@ -216,7 +218,13 @@ class TradeJournal:
                 row.id,
                 environment,
                 TradeStatus.OPEN.value,
-                payload={"note": "Posición abierta"},
+                payload={
+                    "note": (
+                        "Posición abierta"
+                        if filled_at is not None
+                        else "Entrada pendiente de ejecución"
+                    )
+                },
             )
             log.info(
                 "journal.trade_opened",

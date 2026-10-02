@@ -331,11 +331,53 @@ class _Execution:
 
 
 class _Session:
+    """Minimal async session: enough for the repository read paths.
+
+    ``execute`` returns empty result sets, which is the honest answer for a fake
+    with no database behind it. Anything that reaches a trade row will get ``None``
+    and be treated as "no pending entries".
+    """
+
     def __init__(self) -> None:
         self.closed = False
 
     async def close(self) -> None:
         self.closed = True
+
+    async def execute(self, stmt):
+        class _Scalars:
+            def all(self_inner):
+                return []
+
+            def first(self_inner):
+                return None
+
+        class _Scalar:
+            def scalar_one(self_inner):
+                return None
+
+            def scalar_one_or_none(self_inner):
+                return None
+
+        return _Result()
+
+
+class _Result:
+    def scalars(self_inner):
+        class _Scalars:
+            def all(self_inner_inner):
+                return []
+
+            def first(self_inner_inner):
+                return None
+
+        return _Scalars()
+
+    def scalar_one(self_inner):
+        return None
+
+    def scalar_one_or_none(self_inner):
+        return None
 
 
 class _Database:

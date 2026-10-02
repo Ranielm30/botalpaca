@@ -11,6 +11,7 @@ import datetime as dt
 import html
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from botalpaca.config.logging import get_logger
 from botalpaca.domain import (
@@ -23,8 +24,21 @@ from botalpaca.domain import (
     TradePlan,
     TradingEnvironment,
 )
+
+if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a layer cycle
+    from botalpaca.monitoring.service import PositionAlert
+
 from botalpaca.notifications import format as fmt
-from botalpaca.notifications.format import ARROW, BULL, CHART, SHIELD, WARN
+from botalpaca.notifications.format import (
+    ARROW,
+    BULL,
+    CHART,
+    CLOCK,
+    INFO,
+    SHIELD,
+    TARGET,
+    WARN,
+)
 
 log = get_logger(__name__)
 
@@ -177,19 +191,29 @@ def render_account(account: AccountSnapshot) -> str:
     )
 
 
+# An entry waiting on the market open is not a position yet, and saying so
+# plainly is better than showing a zero P&L that looks like a flat trade.
+PENDING_LABEL = "PENDIENTE"
+
+
 def render_positions(
     positions: Sequence[PositionSnapshot],
     environment: TradingEnvironment,
     *,
     protection: dict[str, object] | None = None,
+    pending: Sequence[object] = (),
 ) -> str:
     """One card per position, each block self-contained and scannable.
 
     ``protection`` maps symbol -> ``ProtectionState`` so the operator can see at a
     glance whether a position is actually protected; that is the single most
     important fact on this screen.
+
+    ``pending`` carries the entries Alpaca is holding because the market was
+    closed. They are not positions yet, so they get their own clearly labelled
+    section instead of a fake P&L of zero.
     """
-    if not positions:
+    if not positions and not pending:
         return "\n".join(
             [
                 fmt.header("Sin posiciones", env_badge(environment)),
@@ -197,7 +221,41 @@ def render_positions(
             ]
         )
 
-    lines = [fmt.header(f"Posiciones abiertas ({len(positions)})", env_badge(environment))]
+    total_count = len(positions) + len(pending)
+    lines = [fmt.header(f"Posiciones abiertas ({total_count})", env_badge(environment))]
+
+    if pending:
+        for row in pending:
+            symbol = str(getattr(row, "symbol", "")).upper()
+            qty = float(getattr(row, "qty", 0.0) or 0.0)
+            entry = float(getattr(row, "entry_price", 0.0) or 0.0)
+            stop = float(getattr(row, "stop_price", 0.0) or 0.0)
+            target = float(getattr(row, "target_price", 0.0) or 0.0)
+            opened = getattr(row, "opened_at", None)
+            lines.append("")
+            lines.append(
+                f"{INFO} <b>{fmt.esc(symbol)}</b>  ·  {qty:g} acciones  ·  "
+                f"<b>{PENDING_LABEL}</b>"
+            )
+            lines.append(fmt.RULE_THIN)
+            lines.append(fmt.row("Entrada prevista", money(entry)))
+            lines.append(fmt.row("Stop", money(stop)))
+            lines.append(fmt.row("Target", money(target)))
+            lines.append(f"  {CLOCK} En espera de que abra el mercado.")
+            if opened is not None:
+                lines.append(fmt.row("Enviada", opened.strftime("%d/%m %H:%M UTC")))
+            lines.append(
+                f"  {INFO} Se ejecutara sola al abrir. No cuenta todavia como posicion."
+            )
+
+    if not positions:
+        # A pending entry has no P&L yet. Printing a zero total would read as a
+        # flat trade rather than an order that has not executed.
+        lines.append("")
+        lines.append(fmt.RULE)
+        lines.append(f"{CHART} Te aviso en cuanto se ejecute.")
+        return "\n".join(lines)
+
     total = 0.0
     for index, p in enumerate(positions, start=1):
         total += p.unrealized_pl or 0.0
@@ -222,6 +280,28 @@ def render_positions(
     lines.append(fmt.RULE)
     lines.append(f"{'P&amp;L no realizado'}: <b>{money(total)}</b>")
     lines.append(f"{CHART} Pulsa un boton para operar sobre esa posicion.")
+    return "\n".join(lines)
+
+
+def render_fill(alert: PositionAlert) -> str:
+    """The notification that lands the moment an entry executes.
+
+    Typed under ``TYPE_CHECKING`` on purpose: ``PositionAlert`` lives in the
+    monitoring layer, which already depends on notifications. Importing it for
+    real would close the loop.
+    """
+    lines = [
+        fmt.header(f"{alert.symbol} ejecutada", env_badge(alert.environment)),
+        f"{BULL} {fmt.row('Cantidad', f'{abs(alert.qty or 0):g} acciones')}",
+        f"{BULL} {fmt.row('Precio de entrada', money(alert.fill_price or 0.0))}",
+    ]
+    if alert.stop_price:
+        lines.append(f"{SHIELD} {fmt.row('Stop', money(alert.stop_price))}")
+    if alert.target_price:
+        lines.append(f"{TARGET} {fmt.row('Target', money(alert.target_price))}")
+    lines.append("")
+    lines.append(f"{INFO} El stop y el target ya estan vivos en Alpaca.")
+    lines.append(f"{CLOCK} El bot la vigila y la protege solo.")
     return "\n".join(lines)
 
 
@@ -362,6 +442,7 @@ __all__ = [
     "pct_auto",
     "render_account",
     "render_orders",
+    "render_fill",
     "render_position_alert",
     "render_positions",
     "render_opportunity",

@@ -84,6 +84,68 @@ class TradeRepository:
         )
         return (await self._s.execute(stmt)).scalars().first()
 
+    async def get_pending(
+        self, environment: TradingEnvironment
+    ) -> Sequence[TradeModel]:
+        """Open trades whose entry order has not filled yet.
+
+        A pending trade is a real commitment: Alpaca holds the order and will
+        fill it at the open, so it stays out of ``status`` and out of nothing
+        else either. It is only excluded from the "positions" view.
+        """
+        stmt = (
+            self._base(environment)
+            .where(TradeModel.status == TradeStatus.OPEN.value)
+            .where(TradeModel.filled_at.is_(None))
+            .where(TradeModel.qty != 0)
+            .order_by(TradeModel.opened_at)
+        )
+        return (await self._s.execute(stmt)).scalars().all()
+
+    async def get_pending_for_order(
+        self, order_id: str, environment: TradingEnvironment
+    ) -> TradeModel | None:
+        """The pending trade sitting behind a given Alpaca entry order."""
+        if not order_id:
+            return None
+        stmt = (
+            self._base(environment)
+            .where(TradeModel.entry_order_id == order_id)
+            .where(TradeModel.status == TradeStatus.OPEN.value)
+            .where(TradeModel.filled_at.is_(None))
+        )
+        return (await self._s.execute(stmt)).scalars().first()
+
+    async def mark_filled(
+        self,
+        trade_id: int,
+        environment: TradingEnvironment,
+        *,
+        filled_at: dt.datetime,
+        entry_price: float | None = None,
+    ) -> bool:
+        """Flip a pending trade to filled. Returns False if it already was.
+
+        The entry price is corrected to what Alpaca actually paid, not what the
+        plan assumed, so the P&L the operator sees is the real one.
+        """
+        row = await self.get(trade_id, environment)
+        if row is None or row.filled_at is not None:
+            return False
+        row.filled_at = filled_at
+        if entry_price is not None:
+            row.entry_price = entry_price
+        await self._s.flush()
+        await self.add_event(
+            trade_id,
+            environment,
+            TradeStatus.OPEN.value,
+            payload={
+                "note": f"Ejecutada a {entry_price:.2f}" if entry_price else "Ejecutada"
+            },
+        )
+        return True
+
     async def get_all(
         self,
         environment: TradingEnvironment,

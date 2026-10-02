@@ -38,6 +38,8 @@ SHIELD = "🛡"
 CHART = "📊"
 INFO = "ℹ"
 WARN = "⚠"
+TARGET = "🎯"
+CLOCK = "🕐"
 
 
 def esc(value: object) -> str:

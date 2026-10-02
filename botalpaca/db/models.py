@@ -88,6 +88,10 @@ class TradeModel(Base):
     duration_seconds: Mapped[int | None] = mapped_column(Integer, nullable=True)
 
     opened_at: Mapped[dt.datetime] = mapped_column(DateTime(timezone=True), nullable=False, default=_utcnow)
+    # None while the entry order is still waiting to fill (market closed); set
+    # once Alpaca reports a fill. Kept out of ``status`` on purpose so pending
+    # trades still count towards exposure limits.
+    filled_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     closed_at: Mapped[dt.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     indicators: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
