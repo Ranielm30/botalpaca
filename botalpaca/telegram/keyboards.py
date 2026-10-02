@@ -56,17 +56,20 @@ def mode_keyboard(environment: TradingEnvironment) -> InlineKeyboardMarkup:
 
 
 def signal_keyboard(symbol: str) -> InlineKeyboardMarkup:
-    """ACEPTAR / RECHAZAR / DETALLES, as required for monitored signals."""
+    """One decision row plus one detail row.
+
+    Deliberately short: the card above already carries the score, the levels and
+    the reasoning, so the keyboard only has to offer the choice and a way to look
+    deeper.
+    """
     return InlineKeyboardMarkup(
         [
             [
                 InlineKeyboardButton("✅ ACEPTAR", callback_data=f"{ACCEPT_SIGNAL}:{symbol}"),
-                InlineKeyboardButton("❌ RECHAZAR", callback_data=f"{REJECT_SIGNAL}:{symbol}"),
+                InlineKeyboardButton("❌ CANCELAR", callback_data=f"{REJECT_SIGNAL}:{symbol}"),
             ],
             [
-                InlineKeyboardButton("🔎 DETALLES", callback_data=f"{SIGNAL_DETAILS}:{symbol}"),
-                InlineKeyboardButton("ℹ️ Estadísticas", callback_data=f"{STATS_DETAIL}:{symbol}"),
-                InlineKeyboardButton("⚠️ Riesgo", callback_data=f"{RISK_DETAIL}:{symbol}"),
+                InlineKeyboardButton("🔎 Ver detalle", callback_data=f"{SIGNAL_DETAILS}:{symbol}"),
             ],
         ]
     )

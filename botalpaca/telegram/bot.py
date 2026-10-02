@@ -122,7 +122,6 @@ def register_handlers(bot_app: TelegramApplication, facade: TelegramFacade) -> N
         "status": "status",
         "modo": "modo",
         "analizar": "analizar",
-        "oportunidades": "oportunidades",
         "detalles": "detalles",
         "riesgo": "riesgo",
         "cuenta": "cuenta",
@@ -158,8 +157,7 @@ COMMAND_DESCRIPTIONS: dict[str, str] = {
     "help": "Índice de todos los comandos",
     "status": "Salud: base de datos, Alpaca, scheduler, kill switch",
     "modo": "Ver o cambiar entre ALPACA PAPER y ALPACA REAL",
-    "analizar": "Analizar símbolos o escanear el universo",
-    "oportunidades": "Últimas oportunidades detectadas",
+    "analizar": "Analizar el mercado y mostrar las mejores entradas",
     "detalles": "Detalle completo de un símbolo",
     "riesgo": "Límites de riesgo y exposición actual",
     "cuenta": "Equity, cash, buying power y valor de cartera",
@@ -232,7 +230,7 @@ async def _route(
     if action == kb.CANCEL_PENDING:
         return await facade.cancelar_pendiente(update)
     if action == kb.ACCEPT_SIGNAL:
-        return await facade.comprar(update, payload)
+        return await facade.aceptar(update, payload)
     if action == kb.REJECT_SIGNAL:
         return await facade.rechazar(update, payload)
     if action == kb.SIGNAL_DETAILS:
@@ -275,6 +273,8 @@ async def _route(
             return await facade.portfolio(update, None)
         if payload == "orders":
             return await facade.ordenes(update, None)
+        if payload == "analizar":
+            return await facade.analizar(update, None)
         return await facade.posiciones(update, None)
     if action == kb.ADD_POSITION:
         return await facade._propose(update, payload, direction="long")

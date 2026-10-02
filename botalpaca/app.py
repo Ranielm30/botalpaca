@@ -215,6 +215,7 @@ class EnvironmentContext:
             environment=environment,
             notify=notify_position,
             settings=settings.monitoring,
+            protection_settings=settings.protection,
         )
 
     # ------------------------------------------------------------------ helpers

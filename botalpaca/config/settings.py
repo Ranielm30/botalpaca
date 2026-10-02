@@ -138,6 +138,36 @@ class ProtectionSettings(BaseSettings):
     # a wide stop.
     fallback_stop_pct: float = Field(default=3.0, gt=0, le=25)
 
+    # ------------------------------------------------------------ autonomy
+    # The operator asked the bot to manage open positions by itself: these
+    # rules fire without a Telegram confirmation, and each firing is reported.
+    # Only ENTRY requires a human; protecting an already-open position is a
+    # mechanical decision the risk rules can make far faster than a person.
+    auto_break_even: bool = True
+    """Move the stop to break-even once the trade passes `break_even_trigger_r`."""
+
+    auto_progressive: bool = True
+    """Keep ratcheting the stop up as the trade keeps winning."""
+
+    auto_trailing: bool = True
+    """Arm a trailing stop once the trade passes `trailing_trigger_r`."""
+
+    trailing_trigger_r: float = Field(default=1.5, gt=0)
+    """R multiple at which the trailing stop takes over from the fixed stop."""
+
+    auto_time_stop: bool = True
+    """Close a position whose `default_time_stop_minutes` has expired."""
+
+    auto_momentum_exit: bool = False
+    """Close a position on a momentum collapse.
+
+    Off by default: unlike moving a stop, this *realises* a loss, so it stays
+    opt-in rather than surprising the operator with an automatic close.
+    """
+
+    # Notification cooldown, so a long losing trade does not spam every minute.
+    autonomy_notify_cooldown_minutes: int = Field(default=30, ge=0)
+
 
 class MonitoringSettings(BaseSettings):
     model_config = SettingsConfigDict(

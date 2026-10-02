@@ -18,7 +18,7 @@ import asyncio
 import datetime as dt
 from dataclasses import dataclass, field
 
-from botalpaca.config import MonitoringSettings, get_settings
+from botalpaca.config import MonitoringSettings, ProtectionSettings, get_settings
 from botalpaca.config.logging import get_logger
 from botalpaca.db import AppStateRepository, Database
 from botalpaca.domain import (
@@ -31,6 +31,8 @@ from botalpaca.domain import (
 from botalpaca.market import MarketDataService
 from botalpaca.protection import PositionProtectionManager
 from botalpaca.scanner import MarketScanner, ScanResult
+
+from .autonomy import AutonomousProtector, AutonomyReport
 
 log = get_logger(__name__)
 
@@ -158,6 +160,7 @@ class PositionMonitor:
         environment: TradingEnvironment,
         notify: object | None = None,
         settings: MonitoringSettings | None = None,
+        protection_settings: ProtectionSettings | None = None,
     ) -> None:
         self._portfolio = portfolio
         self._scanner = scanner
@@ -166,8 +169,20 @@ class PositionMonitor:
         self.environment = environment
         self._notify = notify
         self.settings = settings or get_settings().monitoring
+        self.protection_settings = protection_settings or get_settings().protection
         self._last_alert: dict[str, dt.datetime] = {}
+        self._last_autonomy: dict[str, dt.datetime] = {}
         self._running = False
+        self.autonomy = AutonomousProtector(
+            protection,
+            environment=environment,
+            settings=self.protection_settings,
+            notify=notify,
+        )
+
+    async def apply_autonomy(self, position: PositionSnapshot) -> list[AutonomyReport]:
+        """Run the unattended protection rules for one position."""
+        return await self.autonomy.evaluate(position)
 
     @property
     def running(self) -> bool:
@@ -180,6 +195,11 @@ class PositionMonitor:
         for position in positions:
             if position.qty == 0:
                 continue
+            # Protection runs first and unattended: securing an open position
+            # is more urgent than telling the operator about it.
+            reports = await self.apply_autonomy(position)
+            if reports:
+                self._last_autonomy[position.symbol] = dt.datetime.now(dt.UTC)
             alert = await self.check_position(position)
             if alert is not None:
                 alerts.append(alert)

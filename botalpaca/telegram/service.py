@@ -401,24 +401,131 @@ class TelegramFacade:
         return CommandResult("\n".join(blocks))
 
     async def _scan_universe(self) -> CommandResult:
-        result = await self.app.scan()
-        best = result.best()[:5]
-        header = [
-            f"{env_badge(self.environment)} <b>Mejores oportunidades</b>",
-            f"Analizados: {result.scanned} · Con señal: {len(result.opportunities)} · "
-            f"Operables: {len(result.tradable)} · {result.duration_seconds:.1f}s",
-        ]
-        if not best:
-            header.append("\nNinguna señal alcanza el umbral de reporte ahora mismo.")
-            return CommandResult("\n".join(header))
-        for opportunity in best:
-            self._remember(opportunity)
-            header.append("")
-            header.append(render_opportunity(opportunity, environment=self.environment))
-        return CommandResult("\n".join(header))
+        """The market panel: the best entries right now, one card each.
 
-    async def oportunidades(self, update: object, args: str | None = None) -> CommandResult:
-        return await self.analizar(update, args)
+        Every card carries its own ACEPTAR / CANCELAR row, so the screen stays
+        readable instead of ending in a wall of buttons.
+        """
+        result = await self.app.scan()
+        tradable = result.tradable[:5]
+        header = [
+            fmt.header("Panel de mercado", env_badge(self.environment)),
+            f"  {fmt.BULL} Analizados <b>{result.scanned}</b>"
+            f" ({result.failed} con error)",
+            f"  {fmt.BULL} Senales operables <b>{len(result.tradable)}</b>",
+            f"  {fmt.BULL} Tiempo <b>{result.duration_seconds:.1f}s</b>",
+        ]
+        if not tradable:
+            lines = header + [
+                "",
+                fmt.RULE,
+                f"{fmt.INFO} Ninguna senal cumple ahora mismo el score minimo y el R:R.",
+                "El bot te avisara en cuanto aparezca una.",
+            ]
+            return CommandResult("\n".join(lines))
+
+        for opportunity in tradable:
+            self._remember(opportunity)
+        lines = header
+        for opportunity in tradable:
+            lines.append("")
+            lines.append(fmt.RULE)
+            lines.append(render_opportunity(opportunity, environment=self.environment))
+
+        # One button row per opportunity, so accepting one never mixes with
+        # another and the message never becomes a wall of buttons.
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton(
+                        f"\u2705 ACEPTAR {o.symbol}",
+                        callback_data=f"{kb.ACCEPT_SIGNAL}:{o.symbol}",
+                    ),
+                    InlineKeyboardButton(
+                        "\u274c CANCELAR",
+                        callback_data=f"{kb.REJECT_SIGNAL}:{o.symbol}",
+                    ),
+                ]
+                for o in tradable
+            ]
+            + [[InlineKeyboardButton("\U0001f504 Volver a analizar", callback_data=f"{kb.REFRESH}:analizar")]]
+        )
+        return CommandResult("\n".join(lines), keyboard)
+
+    async def aceptar(self, update: object, symbol: str) -> CommandResult:
+        """Accept an opportunity from the panel: one tap opens the order.
+
+        PAPER executes immediately. REAL still shows the mandatory money
+        confirmation card - that gate is not optional, which is why the operator
+        sees two taps there and one here.
+        """
+        user_id = await self.authorize(update)
+        target = parse_symbol(symbol)
+
+        outcome = await self.app.analyze_symbol(target)
+        if outcome is None:
+            raise CommandError(f"No hay datos suficientes para {target}.")
+        snapshot, opportunities = outcome
+        if not opportunities:
+            raise CommandError(f"{target} no tiene senal ahora mismo.")
+
+        direction = opportunities[0].direction
+        chosen = self._pick(opportunities, direction)
+        if chosen is None:
+            raise CommandError(f"{target} no tiene senal operable ahora mismo.")
+        self._remember(chosen)
+
+        context = await self.app.active.risk_context()
+        assessment = await self.app.active.risk.assess(chosen, context)
+        if not assessment.approved:
+            detail = "; ".join(assessment.blocks or assessment.reasons) or "riesgo"
+            return CommandResult(
+                "\n".join(
+                    [
+                        fmt.header("Operacion no permitida", env_badge(self.environment)),
+                        f"{fmt.WARN} {target}: {detail}",
+                    ]
+                )
+            )
+
+        plan = self.app.active.build_plan(chosen, assessment)
+
+        if self.environment.is_real:
+            await self.app.confirmations.request(
+                kind=ConfirmationKind.TRADE,
+                user_id=user_id,
+                environment=self.environment,
+                summary=f"{target} {plan.direction.value}",
+                details={
+                    "plan": plan.model_dump(mode="json"),
+                    "fingerprint": chosen.fingerprint,
+                    "assessment": assessment.model_dump(mode="json"),
+                },
+            )
+            return CommandResult(
+                render_real_warning(plan, assessment),
+                kb.real_confirm_keyboard(target),
+            )
+
+        result = await self.app.submit_plan(
+            plan, assessment, user_id=user_id, opportunity=chosen
+        )
+        await self.app.journal.mark_signal_accepted(self.environment, chosen.fingerprint)
+        order = result.order
+        return CommandResult(
+            "\n".join(
+                [
+                    fmt.header(f"{target} enviada", env_badge(self.environment)),
+                    f"  {fmt.BULL} Direccion <b>{plan.direction.value}</b>",
+                    f"  {fmt.BULL} Cantidad <b>{plan.qty:g}</b>",
+                    f"  {fmt.BULL} Stop <b>{money(plan.stop_loss)}</b>",
+                    f"  {fmt.BULL} Target <b>{money(plan.take_profit)}</b>",
+                    f"  {fmt.BULL} Alpaca ID <code>{fmt.esc(order.id if order else 'n/d')}</code>",
+                    "",
+                    f"{fmt.SHIELD} Stop y target ya estan vivos en Alpaca.",
+                ]
+            )
+        )
 
     async def detalles(self, update: object, symbol: str | None = None) -> CommandResult:
         """Full analysis of one symbol. Typed as `/detalles AAPL`.
