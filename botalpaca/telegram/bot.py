@@ -132,7 +132,7 @@ def register_handlers(bot_app: TelegramApplication, facade: TelegramFacade) -> N
         "comprar": "comprar",
         "vender": "vender",
         "cerrar": "cerrar",
-        "cancelar": "cancelar_orden",
+        "cancelar": "cancelar",
         "modificar": "modificar",
         "stats": "stats",
         "historial": "historial",
@@ -266,6 +266,20 @@ async def _route(
     if action in {"long", "short"}:
         method = facade.comprar if action == "long" else facade.vender
         return await method(update, payload)
+    if action == kb.POSITION_MENU:
+        return await facade.position_menu(update, payload)
+    if action == kb.REFRESH:
+        if payload == "pos":
+            return await facade.posiciones(update, None)
+        if payload == "portfolio":
+            return await facade.portfolio(update, None)
+        if payload == "orders":
+            return await facade.ordenes(update, None)
+        return await facade.posiciones(update, None)
+    if action == kb.ADD_POSITION:
+        return await facade._propose(update, payload, direction="long")
+    if action == kb.REDUCE_POSITION:
+        return await facade._propose(update, payload, direction="short")
     raise CommandError(f"Acción desconocida: {action}")
 
 

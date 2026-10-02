@@ -23,6 +23,8 @@ from botalpaca.domain import (
     TradePlan,
     TradingEnvironment,
 )
+from botalpaca.notifications import format as fmt
+from botalpaca.notifications.format import ARROW, BULL, CHART, SHIELD, WARN
 
 log = get_logger(__name__)
 
@@ -175,37 +177,107 @@ def render_account(account: AccountSnapshot) -> str:
     )
 
 
-def render_positions(positions: Sequence[PositionSnapshot], environment: TradingEnvironment) -> str:
+def render_positions(
+    positions: Sequence[PositionSnapshot],
+    environment: TradingEnvironment,
+    *,
+    protection: dict[str, object] | None = None,
+) -> str:
+    """One card per position, each block self-contained and scannable.
+
+    ``protection`` maps symbol -> ``ProtectionState`` so the operator can see at a
+    glance whether a position is actually protected; that is the single most
+    important fact on this screen.
+    """
     if not positions:
-        return f"{env_badge(environment)} No hay posiciones abiertas."
-    lines = [f"{env_badge(environment)} <b>Posiciones ({len(positions)})</b>"]
-    for p in positions:
-        lines.append(
-            f"\n• <b>{p.symbol}</b> {p.qty:g} @ {money(p.avg_entry_price)} → {money(p.current_price)}"
+        return "\n".join(
+            [
+                fmt.header("Sin posiciones", env_badge(environment)),
+                f"No hay posiciones abiertas en {environment.label}.",
+            ]
         )
-        lines.append(f"  P&L {money(p.unrealized_pl)} ({pct_auto(p.unrealized_plpc)})")
-    total = sum(p.unrealized_pl for p in positions)
-    lines.append(f"\nP&L no realizado total: <b>{money(total)}</b>")
+
+    lines = [fmt.header(f"Posiciones abiertas ({len(positions)})", env_badge(environment))]
+    total = 0.0
+    for index, p in enumerate(positions, start=1):
+        total += p.unrealized_pl or 0.0
+        state = (protection or {}).get(p.symbol)
+        lines.append("")
+        lines.append(f"<b>{index}. {fmt.esc(p.symbol)}</b>  ·  {fmt.esc(p.side)}  ·  {abs(p.qty):g} acciones")
+        lines.append(fmt.RULE_THIN)
+        lines.append(fmt.row("Entrada", money(p.avg_entry_price)))
+        lines.append(fmt.row("Precio actual", money(p.current_price)))
+        pl = p.unrealized_pl or 0.0
+        change = p.unrealized_plpc
+        lines.append(
+            f"{fmt.trend_glyph(change)} P&amp;L  {ARROW}  <b>{money(pl)}</b> "
+            f"({pct_auto(change)})"
+        )
+        lines.append(fmt.row("Valor", money(p.market_value)))
+        if state is not None:
+            lines.append(_protection_line(state))
+        else:
+            lines.append(f"  {BULL} {WARN} Proteccion: sin dato")
+    lines.append("")
+    lines.append(fmt.RULE)
+    lines.append(f"{'P&amp;L no realizado'}: <b>{money(total)}</b>")
+    lines.append(f"{CHART} Pulsa un boton para operar sobre esa posicion.")
     return "\n".join(lines)
 
 
-def render_orders(orders: Sequence[OrderState], environment: TradingEnvironment) -> str:
+def _protection_line(state: object) -> str:
+    """One compact line describing the live protection of a position."""
+    has_stop = bool(getattr(state, "has_stop", False))
+    has_tp = bool(getattr(state, "has_take_profit", False))
+    has_trail = bool(getattr(state, "has_trailing", False))
+    bits: list[str] = []
+    if has_stop:
+        bits.append(f"stop {money(getattr(state, 'stop_price', None))}")
+    elif has_trail:
+        percent = getattr(state, "trail_percent", None)
+        bits.append(f"trailing {percent:.2f}%" if percent else "trailing")
+    else:
+        bits.append("SIN STOP")
+    if has_tp:
+        bits.append(f"target {money(getattr(state, 'take_profit_price', None))}")
+    if getattr(state, "break_even_active", False):
+        bits.append("break-even")
+    mark = SHIELD if (has_stop or has_trail) else WARN
+    return f"  {BULL} {mark} {' · '.join(fmt.esc(b) for b in bits)}"
+
+
+def render_orders(
+    orders: Sequence[OrderState],
+    environment: TradingEnvironment,
+    *,
+    title: str = "Ordenes abiertas",
+) -> str:
     if not orders:
-        return f"{env_badge(environment)} No hay órdenes."
-    lines = [f"{env_badge(environment)} <b>Órdenes ({len(orders)})</b>"]
+        return "\n".join(
+            [
+                fmt.header(f"Sin ordenes · {title}", env_badge(environment)),
+                f"No hay ordenes en {environment.label}.",
+            ]
+        )
+    lines = [fmt.header(f"{title} ({len(orders)})", env_badge(environment))]
     for o in orders[:25]:
         size = o.qty if o.qty is not None else o.notional
-        parts = [
-            f"• {o.symbol} {o.side.value} {size if size is not None else 0:g} "
-            f"{o.order_type.value} · {o.status}"
-        ]
+        side = "compra" if o.side.value == "buy" else "venta"
+        lines.append("")
+        lines.append(f"<b>{fmt.esc(o.symbol)}</b>  {ARROW}  {fmt.esc(side)}  {size:g} acciones")
+        lines.append(fmt.RULE_THIN)
+        lines.append(fmt.row("Tipo", o.order_type.value))
+        lines.append(fmt.row("Estado", o.status))
         if o.limit_price:
-            parts.append(f"@ {money(o.limit_price)}")
+            lines.append(fmt.row("Limite", money(o.limit_price)))
         if o.stop_price:
-            parts.append(f"stop {money(o.stop_price)}")
+            lines.append(fmt.row("Stop", money(o.stop_price)))
         if o.trail_percent:
-            parts.append(f"trail {o.trail_percent:.2f}%")
-        lines.append("".join(parts))
+            lines.append(fmt.row("Trailing", f"{o.trail_percent:.2f}%"))
+        if o.order_class:
+            lines.append(fmt.row("Clase", o.order_class.value))
+        if o.id:
+            lines.append(f"  {BULL} Id: <code>{fmt.esc(o.id)}</code>")
     return "\n".join(lines)
 
 

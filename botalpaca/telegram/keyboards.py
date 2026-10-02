@@ -7,6 +7,8 @@ again in the handler.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from botalpaca.domain import TradingEnvironment
@@ -29,6 +31,10 @@ RISK_DETAIL = "riesgo"
 STATS_DETAIL = "stats"
 CONFIRM_ENV = "confirmar_modo"
 HELP = "ayuda"
+POSITION_MENU = "pos_menu"
+ADD_POSITION = "ampliar"
+REDUCE_POSITION = "reducir"
+REFRESH = "refrescar"
 
 #: Token typed by the user to confirm a live-money action.
 REAL_CONFIRM_TOKEN = "REAL"
@@ -123,6 +129,86 @@ def env_confirm_keyboard(target: TradingEnvironment) -> InlineKeyboardMarkup:
             ]
         ]
     )
+
+
+def positions_picker_keyboard(
+    entries: Sequence[tuple[str, float | None]], *, environment: TradingEnvironment
+) -> InlineKeyboardMarkup:
+    """One button per open position, then a row of global actions.
+
+    Tapping a symbol does not act: it opens the action menu for that position, so
+    nothing destructive can happen by a single mis-tap.
+    """
+    rows: list[list[InlineKeyboardButton]] = []
+    for chunk_start in range(0, len(entries), 2):
+        row: list[InlineKeyboardButton] = []
+        for symbol, pl in entries[chunk_start : chunk_start + 2]:
+            glyph = "🟢" if (pl or 0) >= 0 else "🔴"
+            row.append(
+                InlineKeyboardButton(
+                    f"{glyph} {symbol}", callback_data=f"{POSITION_MENU}:{symbol}"
+                )
+            )
+        rows.append(row)
+    if not rows:
+        rows.append([InlineKeyboardButton("Sin posiciones", callback_data=f"{REFRESH}:pos")])
+    rows.append(
+        [
+            InlineKeyboardButton("🔄 Actualizar", callback_data=f"{REFRESH}:pos"),
+            InlineKeyboardButton("📊 Portfolio", callback_data=f"{REFRESH}:portfolio"),
+            InlineKeyboardButton("📋 Órdenes", callback_data=f"{REFRESH}:orders"),
+        ]
+    )
+    rows.append(
+        [InlineKeyboardButton(mode_button_label(environment), callback_data=f"{MODE_SWITCH}:{environment.other.value}")]
+    )
+    return InlineKeyboardMarkup(rows)
+
+
+def position_actions_keyboard(symbol: str) -> InlineKeyboardMarkup:
+    """The action menu for one selected position."""
+    return InlineKeyboardMarkup(
+        [
+            [
+                InlineKeyboardButton(
+                    "🎯 Break-even", callback_data=f"{BREAK_EVEN}:{symbol}"
+                ),
+                InlineKeyboardButton("📉 Trailing", callback_data=f"{TRAILING}:{symbol}"),
+            ],
+            [
+                InlineKeyboardButton(
+                    "💼 Ampliar", callback_data=f"{ADD_POSITION}:{symbol}"
+                ),
+                InlineKeyboardButton(
+                    "📉 Reducir", callback_data=f"{REDUCE_POSITION}:{symbol}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ Modificar orden", callback_data=f"{REPLACE_ORDER}:{symbol}"
+                ),
+                InlineKeyboardButton(
+                    "✖ Cancelar órdenes", callback_data=f"{CANCEL_ORDER}:{symbol}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "🔴 Cerrar posición", callback_data=f"{CLOSE_POSITION}:{symbol}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    "◀️ Volver", callback_data=f"{REFRESH}:pos"
+                ),
+                InlineKeyboardButton("📊 Detalle", callback_data=f"{SIGNAL_DETAILS}:{symbol}"),
+            ],
+        ]
+    )
+
+
+def mode_button_label(environment: TradingEnvironment) -> str:
+    target = environment.other
+    return "🔴 IR A REAL" if target.is_real else "🟢 IR A PAPER"
 
 
 def position_keyboard(symbol: str) -> InlineKeyboardMarkup:

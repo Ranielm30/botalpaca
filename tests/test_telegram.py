@@ -365,6 +365,8 @@ def _snapshot(symbol: str = "AAPL"):
         symbol=symbol,
         timeframe="1D",
         volatility=SimpleNamespace(regime=MarketRegime.TRENDING_UP),
+        trend=SimpleNamespace(direction=SignalDirection.LONG),
+        data_quality=1.0,
     )
 
 
@@ -1009,3 +1011,50 @@ async def test_commands_without_args_are_not_given_any():
         handler = _make_command(method_name, method_name)
         await handler(update, context)
         assert seen.get("kwargs") == ({"args": "PAPER"} if expects_args else {})
+
+
+# -- commands that previously only worked as buttons -------------------------------------
+async def test_detalles_without_symbol_lists_cached_opportunities():
+    facade = TelegramFacade(FakeApp())
+    facade._opportunities["AAPL"] = object()
+    result = await facade.detalles(_update(), None)
+    assert "AAPL" in result.text
+    assert result.keyboard is not None
+
+
+async def test_detalles_without_symbol_and_no_cache_explains_usage():
+    from botalpaca.telegram.service import CommandError
+
+    facade = TelegramFacade(FakeApp())
+    facade._opportunities.clear()
+    with pytest.raises(CommandError, match="detalles"):
+        await facade.detalles(_update(), None)
+
+
+async def test_detalles_with_symbol_is_accepted():
+    facade = TelegramFacade(FakeApp())
+    result = await facade.detalles(_update(), "AAPL")
+    assert "AAPL" in result.text
+
+
+async def test_cancelar_without_arguments_clears_pending():
+    facade = TelegramFacade(FakeApp())
+    result = await facade.cancelar(_update(), None)
+    assert result.text
+
+
+async def test_cancelar_accepts_the_pending_keyword():
+    facade = TelegramFacade(FakeApp())
+    assert (await facade.cancelar(_update(), "PENDIENTE")).text
+
+
+async def test_posiciones_offers_a_picker_keyboard():
+    facade = TelegramFacade(FakeApp())
+    result = await facade.posiciones(_update(), None)
+    assert result.keyboard is not None
+
+
+async def test_ordenes_offers_a_refresh_keyboard():
+    facade = TelegramFacade(FakeApp())
+    result = await facade.ordenes(_update(), None)
+    assert result.keyboard is not None

@@ -12,6 +12,8 @@ import re
 from dataclasses import dataclass
 from typing import Any
 
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+
 from botalpaca.config.logging import get_logger
 from botalpaca.domain import (
     Opportunity,
@@ -33,6 +35,7 @@ from botalpaca.domain.errors import (
 from botalpaca.notifications import (
     env_badge,
     money,
+    pct_auto,
     render_account,
     render_opportunity,
     render_orders,
@@ -42,12 +45,14 @@ from botalpaca.notifications import (
     render_summary,
     render_trade_plan,
 )
+from botalpaca.notifications import format as fmt
 from botalpaca.security import (
     REAL_CONFIRM_TOKEN,
     CircuitOpenError,
     ConfirmationKind,
     RateLimitError,
 )
+from botalpaca.telegram import keyboards as kb
 
 log = get_logger(__name__)
 
@@ -415,26 +420,61 @@ class TelegramFacade:
     async def oportunidades(self, update: object, args: str | None = None) -> CommandResult:
         return await self.analizar(update, args)
 
-    async def detalles(self, update: object, symbol: str) -> CommandResult:
+    async def detalles(self, update: object, symbol: str | None = None) -> CommandResult:
+        """Full analysis of one symbol. Typed as `/detalles AAPL`.
+
+        Without a symbol it falls back to the symbols already in the current
+        opportunity cache, so the button version and the typed version behave
+        identically. Previously this method required `symbol` positionally, so
+        typing `/detalles` raised a TypeError.
+        """
         await self.authorize(update)
+        if not symbol:
+            cached = list(self._opportunities)[:5]
+            if not cached:
+                raise CommandError(
+                    "Uso: <code>/detalles SIMBOLO</code>\nEjemplo: <code>/detalles AAPL</code>"
+                )
+            lines = [fmt.header("Oportunidades recientes", env_badge(self.environment))]
+            for symbol_name in cached:
+                lines.append(f"  {fmt.BULL} {symbol_name}")
+            lines.append("")
+            lines.append(f"{fmt.INFO} Pulsa uno o escribe el comando completo.")
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            f"📊 {name}", callback_data=f"{kb.SIGNAL_DETAILS}:{name}"
+                        )
+                        for name in cached[:5]
+                    ]
+                ]
+            )
+            return CommandResult("\n".join(lines), keyboard)
+
         target = parse_symbol(symbol)
         outcome = await self.app.analyze_symbol(target)
         if outcome is None:
             raise CommandError(f"No hay datos suficientes para {target}.")
         snapshot, opportunities = outcome
-        if not opportunities:
-            return CommandResult(
-                f"{env_badge(self.environment)} <b>{target}</b>\n"
-                f"Sin señales ahora mismo. Régimen: {snapshot.volatility.regime.value}."
-            )
-        blocks = [
-            f"{env_badge(self.environment)} <b>{target}</b> · {snapshot.timeframe}",
+        lines = [
+            fmt.header(f"{target} · {snapshot.timeframe}", env_badge(self.environment)),
+            fmt.row("Regimen", snapshot.volatility.regime.value),
+            fmt.row("Tendencia", (snapshot.trend.direction.value if snapshot.trend.direction else "n/d")),
+            fmt.row("Score maximo", f"{max((o.score for o in opportunities), default=0):.1f}"),
+            fmt.row("Datos", f"{snapshot.data_quality:.0%}"),
         ]
+        if not opportunities:
+            lines.append("")
+            lines.append(f"{fmt.INFO} Sin senales ahora mismo.")
+            return CommandResult(
+                "\n".join(lines), kb.signal_keyboard(target)
+            )
         for opportunity in opportunities[:3]:
             self._remember(opportunity)
-            blocks.append("")
-            blocks.append(self.app.active.explainer.render(opportunity, snapshot))
-        return CommandResult("\n".join(blocks))
+            lines.append("")
+            lines.append(self.app.active.explainer.render(opportunity, snapshot))
+        return CommandResult("\n".join(lines), kb.signal_keyboard(target))
 
     async def riesgo_detalle(self, update: object, symbol: str) -> CommandResult:
         await self.authorize(update)
@@ -510,41 +550,73 @@ class TelegramFacade:
             targets = set(wanted)
             positions = [p for p in positions if p.symbol in targets]
         if not positions:
-            return CommandResult(render_positions([], self.environment))
-
-        blocks = [render_positions(positions, self.environment)]
-        for position in positions:
-            state = await self.app.protection.state_for_position(self.environment, position)
-            blocks.append("")
-            blocks.append(
-                f"<b>{position.symbol}</b> · "
-                + self._protection_summary(state.has_stop, state.stop_price,
-                                           state.has_take_profit, state.take_profit_price,
-                                           state.has_trailing, state.trail_percent,
-                                           state.break_even_active)
+            return CommandResult(
+                render_positions([], self.environment),
+                kb.positions_picker_keyboard([], environment=self.environment),
             )
-            if state.notes:
-                blocks.extend(f"• {note}" for note in state.notes[:3])
-        return CommandResult("\n".join(blocks))
 
-    @staticmethod
-    def _protection_summary(
-        has_stop: bool,
-        stop_price: float | None,
-        has_tp: bool,
-        tp_price: float | None,
-        has_trail: bool,
-        trail_percent: float | None,
-        break_even: bool,
-    ) -> str:
-        parts = [f"Stop: {money(stop_price)}" if has_stop else "⛔ Sin stop"]
-        if has_tp:
-            parts.append(f"Target: {money(tp_price)}")
-        if has_trail:
-            parts.append(f"Trailing: {trail_percent:.2f}%" if trail_percent else "Trailing: activo")
-        if break_even:
-            parts.append("Break-even ✅")
-        return " | ".join(parts)
+        protection: dict[str, object] = {}
+        for position in positions:
+            protection[position.symbol] = await self.app.protection.state_for_position(
+                self.environment, position
+            )
+
+        entries = [(p.symbol, p.unrealized_plpc) for p in positions]
+        return CommandResult(
+            render_positions(positions, self.environment, protection=protection),
+            kb.positions_picker_keyboard(entries, environment=self.environment),
+        )
+
+    async def position_menu(self, update: object, symbol: str) -> CommandResult:
+        """Show one position in full, with the actions that apply to it."""
+        await self.authorize(update)
+        target = parse_symbol(symbol)
+        position = await self.app.portfolio.get_position(target)
+        if position is None or position.qty == 0:
+            return CommandResult(
+                "\n".join(
+                    [
+                        fmt.header("Posicion no encontrada", env_badge(self.environment)),
+                        f"No hay posicion abierta de <b>{fmt.esc(target)}</b>.",
+                    ]
+                ),
+                kb.positions_picker_keyboard([], environment=self.environment),
+            )
+
+        state = await self.app.protection.state_for_position(self.environment, position)
+        guard_lines: list[str] = []
+        if state.has_stop:
+            guard_lines.append(fmt.kv("Stop", money(state.stop_price)))
+        elif state.has_trailing:
+            guard_lines.append(fmt.kv("Trailing", "activo"))
+        else:
+            guard_lines.append(f"  {fmt.BULL} {fmt.WARN} <b>Sin stop</b> - posicion expuesta")
+        if state.has_take_profit:
+            guard_lines.append(fmt.kv("Target", money(state.take_profit_price)))
+        if state.break_even_active:
+            guard_lines.append(fmt.kv("Break-even", "activo"))
+        if state.time_stop_at:
+            guard_lines.append(fmt.kv("Time stop", state.time_stop_at.strftime("%Y-%m-%d %H:%M UTC")))
+        for note in state.notes[:3]:
+            guard_lines.append(f"  {fmt.BULL} {fmt.esc(note)}")
+
+        pl = position.unrealized_pl or 0.0
+        lines = [
+            fmt.header(target, env_badge(self.environment)),
+            fmt.row("Direccion", position.side),
+            fmt.row("Cantidad", f"{abs(position.qty):g}"),
+            fmt.row("Entrada", money(position.avg_entry_price)),
+            fmt.row("Precio actual", money(position.current_price)),
+            f"{fmt.trend_glyph(position.unrealized_plpc)} P&amp;L  {fmt.ARROW}  "
+            f"<b>{money(pl)}</b> ({pct_auto(position.unrealized_plpc)})",
+        ]
+        if guard_lines:
+            lines.append(fmt.section("Proteccion"))
+            lines.extend(guard_lines)
+        lines.append("")
+        lines.append(fmt.RULE)
+        lines.append("Elige una accion:")
+        return CommandResult("\n".join(lines), kb.position_actions_keyboard(target))
 
     async def ordenes(self, update: object, args: str | None = None) -> CommandResult:
         await self.authorize(update)
@@ -552,7 +624,21 @@ class TelegramFacade:
         if status not in {"open", "closed", "all"}:
             status = "open"
         orders = await self.app.portfolio.get_orders(status=status, limit=50, nested=True)
-        return CommandResult(render_orders(orders, self.environment))
+        keyboard = InlineKeyboardMarkup(
+            [
+                [
+                    InlineKeyboardButton("🔄 Actualizar", callback_data=f"{kb.REFRESH}:orders"),
+                    InlineKeyboardButton("📋 Abiertas", callback_data=f"{kb.REFRESH}:orders"),
+                    InlineKeyboardButton("✅ Cerradas", callback_data=f"{kb.REFRESH}:closed"),
+                ],
+                [
+                    InlineKeyboardButton("📊 Posiciones", callback_data=f"{kb.REFRESH}:pos"),
+                    InlineKeyboardButton("📈 Portfolio", callback_data=f"{kb.REFRESH}:portfolio"),
+                ],
+            ]
+        )
+        header = f"Ordenes {status}" if status != "open" else "Ordenes abiertas"
+        return CommandResult(render_orders(orders, self.environment, title=header), keyboard)
 
     async def riesgo(self, update: object, args: str | None = None) -> CommandResult:
         await self.authorize(update)
@@ -862,6 +948,20 @@ class TelegramFacade:
                 ]
             )
         )
+
+    async def cancelar(self, update: object, args: str | None = None) -> CommandResult:
+        """`/cancelar` with no argument drops the pending confirmation.
+
+        With an order id it cancels that order, and with a symbol it cancels every
+        open order attached to that position. This command previously only existed
+        as a button target and raised a TypeError when typed.
+        """
+        token = (args or "").strip()
+        if not token:
+            return await self.cancelar_pendiente(update)
+        if token.upper() in {"PENDIENTE", "PENDING"}:
+            return await self.cancelar_pendiente(update)
+        return await self.cancelar_orden(update, token)
 
     async def cancelar_orden(self, update: object, order_id: str) -> CommandResult:
         user_id = await self.authorize(update)
