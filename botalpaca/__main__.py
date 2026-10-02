@@ -99,6 +99,11 @@ async def _run(settings: Settings) -> int:
     await scheduler.run_pending()
 
     await bot_app.initialize()
+    # CRITICAL: python-telegram-bot >= 21 deliberately does NOT fetch updates in
+    # `Application.start()`; the updater must be started explicitly (or via
+    # `run_polling`). Without this line the process runs happily, connects to
+    # Alpaca and serves nothing, because no one ever calls getUpdates.
+    await bot_app.updater.start_polling(drop_pending_updates=False)
     await bot_app.start()
     await scheduler.start()
 
@@ -125,6 +130,9 @@ async def _run(settings: Settings) -> int:
         await stop_event.wait()
     finally:
         await scheduler.stop()
+        # Stop fetching first, then let the application drain its update queue.
+        if bot_app.updater is not None:
+            await bot_app.updater.stop()
         await bot_app.stop()
         await bot_app.shutdown()
         await app.stop()

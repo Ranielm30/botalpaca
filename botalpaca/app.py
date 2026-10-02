@@ -599,8 +599,8 @@ class Application:
         environment = self.active_environment
         positions = await self.portfolio.get_positions()
         notes = await self.protection.reconcile(
-            environment,
-            positions,
+            environment=environment,
+            positions=positions,
             protect_missing=self.settings.protection.auto_protect_missing_stop,
         )
         log.info("app.reconciled", environment=environment.value, notes=len(notes))

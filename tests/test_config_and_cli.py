@@ -169,3 +169,42 @@ def test_main_returns_two_on_configuration_error(monkeypatch, capsys):
     monkeypatch.setattr(__main__, "asyncio", SimpleNamespace(run=boom))
     assert __main__.main(["--check"]) == 2
     assert "sin credenciales" in capsys.readouterr().err
+
+
+async def test_reconcile_calls_protection_with_keyword_arguments(database, settings):
+    """Reconciliation runs on every startup, before the bot accepts commands.
+
+    It used to call `protection.reconcile(environment, positions, ...)`
+    positionally while the manager declares those arguments keyword-only, so the
+    very first `scheduler.run_pending()` on a fresh deploy died with a TypeError.
+    """
+    from types import SimpleNamespace
+
+    from botalpaca.app import Application
+
+    app = Application(settings, database=database)
+    environment = app.settings.active_trading_environment
+
+    seen: dict[str, object] = {}
+
+    class _Protection:
+        async def reconcile(self, **kwargs: object) -> list[str]:
+            seen.update(kwargs)
+            return ["ok"]
+
+    class _Portfolio:
+        async def get_positions(self) -> list[object]:
+            return []
+
+    app.active = SimpleNamespace(
+        environment=environment,
+        protection=_Protection(),
+        portfolio=_Portfolio(),
+    )
+
+    notes = await app.reconcile()
+
+    assert notes == ["ok"]
+    assert seen["environment"] == environment
+    assert seen["positions"] == []
+    assert "protect_missing" in seen

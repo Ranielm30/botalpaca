@@ -805,3 +805,116 @@ def test_authorization_error_is_a_botalpaca_error():
     from botalpaca.domain.errors import BotalpacaError
 
     assert issubclass(AuthorizationError, BotalpacaError)
+
+
+# -- PTB adapter ---------------------------------------------------------------------
+def test_build_telegram_application_is_constructible():
+    """The PTB adapter must build against the *installed* python-telegram-bot.
+
+    `ApplicationBuilder` exposes neither `.parse_mode()` nor
+    `.drop_pending_updates()`; guessing those method names produced an
+    `AttributeError` only at production startup, because every other test drives
+    the facade directly and never constructs the real Application.
+    """
+    from telegram.ext import Application as TelegramApplication
+
+    from botalpaca.telegram.bot import build_telegram_application
+
+    app = build_telegram_application("123456:AAHunit-test-token")
+    assert isinstance(app, TelegramApplication)
+    assert app.bot_data is not None
+
+
+def test_register_handlers_registers_every_command():
+    from botalpaca.telegram.bot import build_telegram_application, register_handlers
+
+    app = build_telegram_application("123456:AAHunit-test-token")
+    register_handlers(app, None)
+    assert app.handlers[0], "no command handlers registered"
+    assert app.error_handlers, "no error handler registered"
+
+
+def test_run_starts_the_updater(monkeypatch):
+    """`Application.start()` does NOT fetch updates in PTB >= 21.
+
+    The updater must be started explicitly. When it was not, the deployed bot
+    connected to Alpaca, started the scheduler and logged "main.running" while
+    silently never consuming a single Telegram update, so every command the user
+    sent was ignored.
+    """
+    import inspect
+
+    from telegram.ext import Application
+
+    source = inspect.getsource(Application.start)
+    assert "does *not* start fetching updates" in source
+
+    from botalpaca import __main__
+
+    main_source = inspect.getsource(__main__._run)
+    assert "updater.start_polling" in main_source, "the updater is never started"
+    assert "updater.stop()" in main_source, "the updater is never stopped"
+
+
+async def test_answer_sends_to_the_update_chat(monkeypatch):
+    """`CallbackContext` has no `effective_chat`; the chat lives on the update."""
+    from types import SimpleNamespace
+
+    from botalpaca.telegram.bot import _answer
+
+    sent: list[tuple[object, ...]] = []
+
+    class _Bot:
+        async def send_message(self, *args: object, **kwargs: object) -> None:
+            sent.append(args)
+
+    update = SimpleNamespace(effective_chat=SimpleNamespace(id=42), callback_query=None)
+    context = SimpleNamespace(bot=_Bot())
+
+    await _answer(update, context, "hola")
+
+    assert sent == [(42, "hola")]
+    assert sent[0] and isinstance(sent[0][0], int)
+
+
+async def test_answer_resolves_chat_for_callback_queries(monkeypatch):
+    from types import SimpleNamespace
+
+    from botalpaca.telegram.bot import _answer
+
+    sent: list[tuple[object, ...]] = []
+
+    class _Bot:
+        async def send_message(self, *args: object, **kwargs: object) -> None:
+            sent.append(args)
+
+    # A callback query has no effective_chat; the chat is callback_query.message.chat.
+    update = SimpleNamespace(
+        effective_chat=None,
+        callback_query=SimpleNamespace(message=SimpleNamespace(chat=SimpleNamespace(id=99))),
+    )
+    context = SimpleNamespace(bot=_Bot())
+
+    await _answer(update, context, "confirmado")
+
+    assert sent[0][0] == 99
+
+
+async def test_answer_splits_long_messages(monkeypatch):
+    from types import SimpleNamespace
+
+    from botalpaca.telegram.bot import _answer
+
+    sent: list[tuple[object, ...]] = []
+
+    class _Bot:
+        async def send_message(self, *args: object, **kwargs: object) -> None:
+            sent.append(args)
+
+    update = SimpleNamespace(effective_chat=SimpleNamespace(id=7), callback_query=None)
+    context = SimpleNamespace(bot=_Bot())
+
+    await _answer(update, context, "x" * 9000)
+
+    assert len(sent) == 3
+    assert sent[0][0] == 7

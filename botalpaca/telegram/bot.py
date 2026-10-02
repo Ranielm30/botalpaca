@@ -17,6 +17,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    Defaults,
 )
 
 from botalpaca.config.logging import get_logger
@@ -33,27 +34,46 @@ def _args(context: ContextTypes.DEFAULT_TYPE) -> str | None:
     return " ".join(str(a) for a in args) if args else None
 
 
+def _chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
+    """Resolve the chat to reply to.
+
+    ``CallbackContext`` exposes no ``effective_chat``; the chat always comes from
+    the update itself. Callback queries carry it inside ``callback_query.message``
+    (or ``.inline_message_id``, which cannot be replied to as text).
+    """
+    chat = getattr(update, "effective_chat", None)
+    if chat is not None:
+        return chat.id
+    callback = getattr(update, "callback_query", None)
+    message = getattr(callback, "message", None) if callback is not None else None
+    return getattr(message, "chat", None) and message.chat.id
+
+
 async def _answer(
-    context: ContextTypes.DEFAULT_TYPE, text: str, keyboard: object | None = None
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    keyboard: object | None = None,
 ) -> None:
     """Send a reply, splitting on the 4096-char Telegram limit."""
-    chat = context.effective_chat
-    if chat is None:
+    chat_id = _chat_id(update, context)
+    if chat_id is None:
+        log.warning("telegram.reply_skipped_no_chat")
         return
     try:
         if len(text) <= 4096:
             await context.bot.send_message(
-                chat.id, text, parse_mode=ParseMode.HTML, reply_markup=keyboard
+                chat_id, text, parse_mode=ParseMode.HTML, reply_markup=keyboard
             )
             return
         # Long analyses: send the first chunk then the rest sequentially.
         head, remainder = text[:4000], text[4000:]
         await context.bot.send_message(
-            chat.id, head, parse_mode=ParseMode.HTML, reply_markup=keyboard
+            chat_id, head, parse_mode=ParseMode.HTML, reply_markup=keyboard
         )
         for start in range(0, len(remainder), 4000):
             await context.bot.send_message(
-                chat.id, remainder[start : start + 4000], parse_mode=ParseMode.HTML
+                chat_id, remainder[start : start + 4000], parse_mode=ParseMode.HTML
             )
     except TelegramError:
         log.exception("telegram.send_failed")
@@ -66,13 +86,13 @@ async def _dispatch(
     try:
         result: CommandResult = await facade.guard(coro_factory, update, **kwargs)
     except CommandError as exc:
-        await _answer(context, f"⚠️ {exc.user_message}")
+        await _answer(update, context, f"⚠️ {exc.user_message}")
         return
     except AuthorizationError:
         # Never reveal whether the bot exists to unauthorized users.
         log.warning("telegram.unauthorized_attempt", user=update.effective_user)
         return
-    await _answer(context, result.text, result.keyboard)
+    await _answer(update, context, result.text, result.keyboard)
 
 
 def _make_command(name: str, method_name: str):
@@ -133,10 +153,10 @@ async def _on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         result = await facade.guard(_route, update, action, payload, facade)
     except CommandError as exc:
         await query.answer()
-        await _answer(context, f"⚠️ {exc.user_message}")
+        await _answer(update, context, f"⚠️ {exc.user_message}")
         return
     await query.answer()
-    await _answer(context, result.text, result.keyboard)
+    await _answer(update, context, result.text, result.keyboard)
 
 
 async def _route(
@@ -208,12 +228,16 @@ async def _on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 def build_telegram_application(token: str) -> TelegramApplication:
-    """Create the Telegram application with sane defaults."""
+    """Create the Telegram application with sane defaults.
+
+    ``ApplicationBuilder`` has no ``parse_mode`` setter; the supported way to
+    set a default parse mode is through ``Defaults``.
+    """
     return (
         ApplicationBuilder()
         .token(token)
-        .parse_mode(ParseMode.HTML)
-        .drop_pending_updates()
+        .defaults(Defaults(parse_mode=ParseMode.HTML))
+        .concurrent_updates(True)
         .build()
     )
 
