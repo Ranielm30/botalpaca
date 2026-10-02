@@ -678,6 +678,23 @@ class ProtectionRepository:
         )
         return (await self._s.execute(stmt)).scalars().all()
 
+    async def record_initial_stop(
+        self, environment: TradingEnvironment, symbol: str, stop_price: float | None
+    ) -> bool:
+        """Freeze the entry risk the first time it is known; never rewrite it.
+
+        ``upsert`` cannot be used here: it would overwrite the baseline every time
+        the stop is ratcheted, which is exactly the value that must stay put.
+        Returns True when a value was actually written.
+        """
+        row = await self.get(environment, symbol)
+        if row is None or row.initial_stop_price is not None or stop_price is None:
+            return False
+        row.initial_stop_price = float(stop_price)
+        row.updated_at = dt.datetime.now(dt.UTC)
+        await self._s.flush()
+        return True
+
     async def delete(self, environment: TradingEnvironment, symbol: str) -> None:
         await self._s.execute(
             delete(PositionProtectionModel).where(

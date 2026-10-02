@@ -14,7 +14,9 @@ Design constraints taken from the *real* Alpaca API, not from assumptions:
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
+from collections.abc import Sequence
 
 from botalpaca.config import ProtectionSettings, get_settings
 from botalpaca.config.logging import get_logger
@@ -51,6 +53,10 @@ def _is_trailing(order: OrderState) -> bool:
 
 
 # Order states that reserve the shares but can never execute.
+# Alpaca keeps counting a cancelled order as held briefly, so the same
+# terminal set the state resolver uses decides when shares are free.
+_TERMINAL = frozenset({"filled", "canceled", "expired", "replaced", "rejected"})
+
 _INERT_STATUSES = frozenset({"held", "pending_cancel", "pending_replace"})
 
 
@@ -165,6 +171,9 @@ class PositionProtectionManager:
             return live
         live.break_even_active = bool(row.break_even_active)
         live.time_stop_at = row.time_stop_at
+        # Falls back to the live stop only for rows registered before the
+        # baseline existed, and only while nothing has moved it yet.
+        live.initial_stop_price = row.initial_stop_price or row.stop_price
         return live
 
     # ------------------------------------------------------------ registration
@@ -180,15 +189,22 @@ class PositionProtectionManager:
         take_profit_order_id: str | None = None,
         order_class: OrderClass | str | None = None,
         time_stop_minutes: int | None = None,
+        initial_stop_price: float | None = None,
     ) -> ProtectionState:
-        """Persist the protection Alpaca actually accepted for a fresh entry."""
+        """Persist the protection Alpaca actually accepted for a fresh entry.
+
+        ``initial_stop_price`` freezes the risk this trade was opened with. It is
+        written only if the row has none, so re-registering a trade never resets
+        the baseline a position is already being judged against.
+        """
         order_class_value = getattr(order_class, "value", order_class)
         minutes = self._settings.default_time_stop_minutes if time_stop_minutes is None else time_stop_minutes
         time_stop_at = (
             dt.datetime.now(dt.UTC) + dt.timedelta(minutes=minutes) if minutes > 0 else None
         )
         async with self._db.session() as session:
-            await ProtectionRepository(session).upsert(
+            repo = ProtectionRepository(session)
+            await repo.upsert(
                 environment,
                 symbol,
                 qty=abs(qty),
@@ -198,6 +214,8 @@ class PositionProtectionManager:
                 order_class=order_class_value,
                 time_stop_at=time_stop_at,
             )
+            if initial_stop_price is not None:
+                await repo.record_initial_stop(environment, symbol, initial_stop_price)
         log.info(
             "protection.registered",
             environment=environment.value,
@@ -206,6 +224,47 @@ class PositionProtectionManager:
             has_take_profit=take_profit_order_id is not None,
         )
         return await self.get_state(environment, symbol)
+
+    async def _await_shares_free(
+        self,
+        environment: TradingEnvironment,
+        symbol: str,
+        *,
+        ignore: Sequence[str] = (),
+        attempts: int = 8,
+        delay: float = 0.4,
+    ) -> bool:
+        """Wait until Alpaca stops counting a cancelled order as held.
+
+        Cancelling an exit order does not release its shares straight away. A
+        create issued in the same breath is rejected with
+        ``insufficient qty available ... held_for_orders: 4`` naming the very
+        order that was just cancelled, and the replacement silently never lands.
+        Polling for the order to actually go terminal is the difference between
+        a protection swap that works and one that appears to.
+        """
+        skip = set(ignore)
+        for attempt in range(attempts):
+            try:
+                orders = await self._engine.get_live_orders_for_symbol(symbol)
+            except (BotalpacaError, BrokerError, RuntimeError) as exc:
+                log.warning(
+                    "protection.share_probe_failed",
+                    environment=environment.value,
+                    symbol=symbol,
+                    error=str(exc),
+                )
+            else:
+                held = [
+                    o.id
+                    for o in orders
+                    if o.id not in skip and order_status_value(o) not in _TERMINAL
+                ]
+                if not held:
+                    return True
+            if attempt < attempts - 1:
+                await asyncio.sleep(delay)
+        return False
 
     async def _clear_inert_orders(
         self,
@@ -321,6 +380,9 @@ class PositionProtectionManager:
             )
         price = self._sanitize_stop(price, position)
 
+        await self._await_shares_free(
+            environment, position.symbol, ignore=state.inert_order_ids
+        )
         result = await self._engine.submit_protective(
             environment=environment,
             request=OrderBuilder.build_protective_stop(
@@ -386,6 +448,60 @@ class PositionProtectionManager:
                 price = round(position.current_price * 1.01, 2)
         return price
 
+    async def _discard_stale_order(
+        self,
+        environment: TradingEnvironment,
+        symbol: str,
+        stale_id: str | None,
+        current_id: str,
+    ) -> bool:
+        """Make sure the order a replace superseded is genuinely gone.
+
+        Alpaca answers a successful replace with a new id but does not promise
+        the old order reached a terminal state. When it stays live the position
+        ends up carrying two exits, and the looser one can still fire -- which
+        turns a locked-in break-even into a realised loss.
+        """
+        if not stale_id or stale_id == current_id:
+            return False
+        try:
+            await self._await_shares_free(environment, symbol, ignore=(current_id,))
+        except Exception as exc:  # noqa: BLE001
+            log.warning(
+                "protection.stale_probe_failed",
+                environment=environment.value,
+                symbol=symbol,
+                error=str(exc),
+            )
+        live = await self._engine.get_live_orders_for_symbol(symbol)
+        if any(order.id == stale_id for order in live):
+            log.warning(
+                "protection.stale_order_survived_replace",
+                environment=environment.value,
+                symbol=symbol,
+                stale_order_id=stale_id,
+            )
+            try:
+                await self._engine.cancel_order(stale_id, environment=environment)
+            except (BotalpacaError, BrokerError, RuntimeError) as exc:
+                log.error(
+                    "protection.stale_order_cancel_failed",
+                    environment=environment.value,
+                    symbol=symbol,
+                    stale_order_id=stale_id,
+                    error=str(exc),
+                )
+                return False
+            log.info(
+                "protection.stale_order_cancelled",
+                environment=environment.value,
+                symbol=symbol,
+                stale_order_id=stale_id,
+                replaced_by=current_id,
+            )
+            return True
+        return False
+
     # ------------------------------------------------------------- break-even
 
     async def move_to_break_even(
@@ -406,6 +522,13 @@ class PositionProtectionManager:
         )
 
         state = await self.state_for_position(environment, position)
+        # A trailing stop is the exit for this position now. Building a fixed
+        # stop underneath it leaves two exits fighting over the same shares:
+        # each pass cancels the other and the position spends the day with no
+        # working protection at all.
+        if state.has_trailing:
+            state.notes.append("Trailing activo: el break-even no aplica")
+            return state
         if not state.has_stop or not state.stop_order_id:
             return await self.ensure_stop(
                 environment=environment,
@@ -439,6 +562,9 @@ class PositionProtectionManager:
                 error=str(exc),
             )
             await self._engine.cancel_order(state.stop_order_id, environment=environment)
+            await self._await_shares_free(
+                environment, position.symbol, ignore=state.inert_order_ids
+            )
             created = await self._engine.submit_protective(
                 environment=environment,
                 request=OrderBuilder.build_protective_stop(
@@ -475,6 +601,13 @@ class PositionProtectionManager:
             )
             return state
 
+        # Alpaca's replace is not atomic and does not guarantee the old order
+        # died: a live check caught a position carrying both 332.45 and 327.14.
+        # The looser one still fires and closes at a loss, so confirm it is gone
+        # and remove it if the broker left it behind.
+        previous_id = state.stop_order_id
+        await self._discard_stale_order(environment, position.symbol, previous_id, replaced.id)
+
         await self._persist(
             environment,
             position.symbol,
@@ -504,11 +637,45 @@ class PositionProtectionManager:
         position: PositionSnapshot,
         trail_percent: float | None = None,
         atr: float | None = None,
+        floor_stop: float | None = None,
+        widen_to: float | None = None,
     ) -> ProtectionState:
-        percent = trail_percent or self._settings.default_trailing_percent
+        """Arm a trailing stop, never looser than the protection already earned.
+
+        ``floor_stop`` is the lowest price the trail may sit at. Arming a trailing
+        stop below a break-even that has already been secured hands that profit
+        straight back, which is exactly what happened: a trade stopped at 332.45
+        was re-armed at 327.43 and would have closed at a loss while the ledger
+        still claimed break-even was active.
+
+        ``widen_to`` forces a wider trail when the live one has been squeezed
+        against the price by a gap.
+        """
+        if widen_to is not None:
+            percent = max(float(widen_to), self._settings.default_trailing_percent)
+        else:
+            percent = trail_percent or self._settings.default_trailing_percent
         if atr is not None and atr > 0 and position.current_price > 0:
             atr_pct = atr / position.current_price * 100.0 * self._settings.atr_trailing_multiplier
             percent = max(percent, round(atr_pct, 2))
+        if floor_stop is not None and position.current_price > 0:
+            # Alpaca derives the trail from a percentage of the price, so the
+            # floor has to be expressed the same way to be honoured.
+            long_position = position.qty >= 0
+            room = (
+                position.current_price - floor_stop
+                if long_position
+                else floor_stop - position.current_price
+            )
+            if room <= 0:
+                # The floor is already at or past the price: every possible trail
+                # is looser than what was earned, so refuse rather than unwind it.
+                raise ValidationError(
+                    f"El precio ({position.current_price:.2f}) ya esta en o por debajo del "
+                    f"break-even ({floor_stop:.2f}); no se puede armar un trailing mas amplio"
+                )
+            required_pct = round(room / position.current_price * 100.0, 2)
+            percent = max(percent, required_pct)
         if percent <= 0 or percent >= 100:
             raise ValidationError(f"Trail percent inválido ({percent})")
 
@@ -659,6 +826,9 @@ class PositionProtectionManager:
                     error=str(exc),
                 )
 
+        # Cancelling does not release the shares instantly, so wait for the
+        # old legs to actually go terminal before asking for the replacement.
+        await self._await_shares_free(environment, position.symbol)
         try:
             replacement = await self._engine.submit_protective(
                 environment=environment,
@@ -745,7 +915,16 @@ class PositionProtectionManager:
         if not s.progressive_stops:
             return None
         state = await self.state_for_position(environment, position)
-        r_multiple = r_multiple_of(position, state.stop_price)
+        # A trailing stop already ratchets with the price. Adding a fixed stop on
+        # top of it would make the two fight: each pass would cancel the other
+        # and the position would spend every minute without a working exit.
+        if state.has_trailing:
+            return None
+        # Against the baseline, never the live stop: once break-even has moved
+        # the stop above the entry the live stop yields a negative denominator,
+        # which turns R negative and the ratchet buffer into nonsense.
+        baseline = state.initial_stop_price or state.stop_price
+        r_multiple = r_multiple_of(position, baseline)
         if r_multiple is None or r_multiple < s.break_even_trigger_r:
             return None
         buffer = max(s.break_even_buffer_pct, r_multiple * step_pct)

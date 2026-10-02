@@ -35,6 +35,8 @@ def _state(**kw):
     base = dict(
         has_stop=True,
         stop_price=97.0,
+        initial_stop_price=97.0,
+        trail_price=None,
         has_take_profit=False,
         take_profit_price=None,
         has_trailing=False,
@@ -75,8 +77,13 @@ class _Protection:
         self.state = _state(has_stop=True, stop_price=position.current_price * 0.99)
         return self.state
 
-    async def enable_trailing_stop(self, *, environment, position, trail_percent=None, atr=None):
-        self.calls.append(("enable_trailing_stop", {}))
+    async def enable_trailing_stop(
+        self, *, environment, position, trail_percent=None, atr=None,
+        floor_stop=None, widen_to=None,
+    ):
+        self.calls.append(
+            ("enable_trailing_stop", {"floor_stop": floor_stop, "widen_to": widen_to})
+        )
         self.state = _state(has_stop=False, has_trailing=True, trail_percent=2.5)
         return self.state
 
@@ -143,7 +150,9 @@ async def test_break_even_does_not_repeat_once_applied():
 
 
 async def test_trailing_arms_after_its_trigger():
-    protection = _Protection(state=_state(has_stop=True, stop_price=98.0))
+    # The baseline is the stop the trade was *opened* with, and it stays put as
+    # the stop moves -- that is the whole point of freezing it.
+    protection = _Protection(state=_state(has_stop=True, stop_price=98.0, initial_stop_price=98.0))
     settings = ProtectionSettings(auto_break_even=False, auto_progressive=False)
     protector = AutonomousProtector(protection, environment=PAPER, settings=settings)
     # entry 100, stop 98 => risk 2; current 104 => +2R, above trailing_trigger_r 1.5

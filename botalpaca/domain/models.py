@@ -481,6 +481,14 @@ class ProtectionState(Domain):
     break_even_active: bool = False
     time_stop_at: dt.datetime | None = None
     order_class: OrderClass | None = None
+    initial_stop_price: float | None = None
+    """The stop the trade was opened with, kept so R never moves as the stop does.
+
+    Every rule that fires on a multiple of R -- break-even at 1R, trailing at
+    1.5R -- divides by this, not by ``stop_price``. Measuring against the live
+    stop makes a protected trade look like it risked its own profit, and leaves
+    no denominator at all once a trailing stop replaces the fixed one.
+    """
     # Orders that still reserve the shares but cannot execute: a bracket child
     # left in HELD. They must be cleared before any replacement exit can be
     # created, or Alpaca rejects the new order for insufficient qty available.

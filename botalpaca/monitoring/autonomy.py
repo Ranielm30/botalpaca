@@ -32,6 +32,7 @@ class AutonomyAction(StrEnum):
     BREAK_EVEN = "break_even"
     PROGRESSIVE = "progressive"
     TRAILING = "trailing"
+    TRAILING_WIDENED = "trailing_widened"
     TIME_STOP = "time_stop"
     MOMENTUM_EXIT = "momentum_exit"
     STOP_CREATED = "stop_created"
@@ -42,6 +43,7 @@ ACTION_LABELS: dict[AutonomyAction, str] = {
     AutonomyAction.BREAK_EVEN: "Stop movido a break-even",
     AutonomyAction.PROGRESSIVE: "Stop subido (proteccion progresiva)",
     AutonomyAction.TRAILING: "Trailing stop activado",
+    AutonomyAction.TRAILING_WIDENED: "Trailing stop ensanchado",
     AutonomyAction.TIME_STOP: "Cierre por time stop",
     AutonomyAction.MOMENTUM_EXIT: "Cierre por perdida de momentum",
     AutonomyAction.STOP_CREATED: "Stop de emergencia creado",
@@ -149,7 +151,12 @@ class AutonomousProtector:
             return reports
 
         state = await self._protection.state_for_position(self.environment, position)
-        r_now = self._r_multiple(position, state.stop_price)
+        # R is always measured against the risk the trade was opened with. Using
+        # the live stop made a protected trade measure its own profit as risk,
+        # and once a trailing stop replaced the fixed stop there was no stop
+        # price left at all, so the engine fell back to comparing a percent move
+        # against an R threshold and went permanently quiet.
+        r_now = self._r_multiple(position, getattr(state, "initial_stop_price", None))
 
         # 1. A naked position is the worst state; fix that before anything else.
         if not state.has_stop and not state.has_trailing:
@@ -165,7 +172,16 @@ class AutonomousProtector:
                 reports.append(closed)
             return reports
 
-        # 3. Break-even, then progressive ratcheting while it keeps winning.
+        # 3. Once the trailing stop owns the position there is nothing left to
+        # ratchet: it already follows the price, and a fixed stop on top of it
+        # would fight it and cancel the very protection that is running.
+        if state.has_trailing:
+            widened = await self._widen_trailing_if_tight(position, state)
+            if widened is not None:
+                reports.append(widened)
+            return reports
+
+        # 4. Break-even, then progressive ratcheting while it keeps winning.
         if self.settings.auto_break_even and r_now is not None:
             if r_now >= self.settings.break_even_trigger_r and not (
                 state.break_even_active and state.stop_price is not None
@@ -176,21 +192,29 @@ class AutonomousProtector:
                     reports.append(moved)
                     return reports
 
-            if self.settings.auto_progressive and r_now is not None:
-                if r_now > self.settings.break_even_trigger_r + 0.5:
-                    stepped = await self._progressive(position, state, r_now)
-                    if stepped is not None:
-                        reports.append(stepped)
-                        return reports
+            # Below the trailing trigger the stop is ratcheted by hand. At or above it the
+            # trade belongs to the trailing stop, so progressive must yield --
+            # otherwise it fires on every pass, returns early, and the trailing
+            # stop is never armed at all.
+            if (
+                self.settings.auto_progressive
+                and r_now is not None
+                and r_now <= self.settings.trailing_trigger_r
+                and r_now > self.settings.break_even_trigger_r + 0.5
+            ):
+                stepped = await self._progressive(position, state, r_now)
+                if stepped is not None:
+                    reports.append(stepped)
+                    return reports
 
-        # 4. Arm the trailing stop once the trade is clearly in profit.
+        # 5. Arm the trailing stop once the trade is clearly in profit.
         if (
             self.settings.auto_trailing
             and not state.has_trailing
             and r_now is not None
             and r_now >= self.settings.trailing_trigger_r
         ):
-            armed = await self._trailing(position)
+            armed = await self._trailing(position, state, r_now)
             if armed is not None:
                 reports.append(armed)
 
@@ -277,10 +301,15 @@ class AutonomousProtector:
         await self._send(report)
         return report
 
-    async def _trailing(self, position: PositionSnapshot) -> AutonomyReport | None:
+    async def _trailing(
+        self, position: PositionSnapshot, state: object, r_now: float
+    ) -> AutonomyReport | None:
+        # The trail must never be looser than what break-even already secured,
+        # or arming it would quietly give back the protection that just landed.
+        floor = self._break_even_floor(position)
         try:
             updated = await self._protection.enable_trailing_stop(
-                environment=self.environment, position=position
+                environment=self.environment, position=position, floor_stop=floor
             )
         except Exception as exc:  # noqa: BLE001
             log.error("autonomy.trailing_failed", symbol=position.symbol, error=str(exc))
@@ -288,15 +317,82 @@ class AutonomousProtector:
         percent = updated.trail_percent
         if not updated.has_trailing or percent is None:
             return None
-        r_now = self._r_multiple(position, updated.stop_price)
+        detail = f"la operacion supero {self.settings.trailing_trigger_r:.1f}R"
+        if floor is not None:
+            detail += "; el trailing mantiene la ganancia asegurada en break-even"
         report = AutonomyReport(
             action=AutonomyAction.TRAILING,
             symbol=position.symbol,
             environment=self.environment,
             position=position,
-            detail=f"la operacion supero {self.settings.trailing_trigger_r:.1f}R",
+            detail=detail,
             r_multiple=r_now,
             trail_percent=percent,
+            new_stop=floor,
+        )
+        await self._send(report)
+        return report
+
+    def _break_even_floor(self, position: PositionSnapshot) -> float | None:
+        """The lowest price the trailing stop may sit at, or None if unconstrained."""
+        entry = position.avg_entry_price
+        if entry <= 0:
+            return None
+        buffer = self.settings.break_even_buffer_pct
+        return (
+            round(entry * (1 + buffer / 100.0), 2)
+            if position.qty >= 0
+            else round(entry * (1 - buffer / 100.0), 2)
+        )
+
+    async def _widen_trailing_if_tight(
+        self, position: PositionSnapshot, state: object
+    ) -> AutonomyReport | None:
+        """A trailing stop squeezed against the price gets out on noise.
+
+        Alpaca's trailing stop follows the price up but never recalculates its
+        width, so a gap can leave it a few cents under the market. That is not
+        protection, it is a coin flip, and it will take the trade out on noise
+        instead of letting a real move develop.
+        """
+        percent = getattr(state, "trail_percent", None)
+        price = getattr(state, "trail_price", None)
+        current = position.current_price
+        if percent is None or current <= 0:
+            return None
+        if position.qty >= 0:
+            distance_pct = (current - price) / current * 100.0 if price else None
+        else:
+            distance_pct = (price - current) / current * 100.0 if price else None
+        if distance_pct is None:
+            return None
+        # Half the trail width is the floor: below that the stop is inside the
+        # noise band of a normal session.
+        if distance_pct >= percent / 2.0:
+            return None
+        # Ask for genuinely more room. Requesting the width the trail already has
+        # would resolve to the same percentage and quietly do nothing.
+        wider = round(percent * 2.0, 2)
+        try:
+            updated = await self._protection.enable_trailing_stop(
+                environment=self.environment, position=position, widen_to=wider
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.error("autonomy.trailing_widen_failed", symbol=position.symbol, error=str(exc))
+            return None
+        if not updated.has_trailing or updated.trail_percent == percent:
+            return None
+        report = AutonomyReport(
+            action=AutonomyAction.TRAILING_WIDENED,
+            symbol=position.symbol,
+            environment=self.environment,
+            position=position,
+            detail=(
+                f"el trailing se habia acercado a {distance_pct:.2f}% del precio; "
+                f"se ensancha a {updated.trail_percent:.2f}% para no saltar con el ruido"
+            ),
+            r_multiple=self._r_multiple(position, getattr(state, "initial_stop_price", None)),
+            trail_percent=updated.trail_percent,
         )
         await self._send(report)
         return report

@@ -260,6 +260,14 @@ class PositionProtectionModel(Base):
     symbol: Mapped[str] = mapped_column(String(32), nullable=False)
     qty: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     stop_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    initial_stop_price: Mapped[float | None] = mapped_column(Float, nullable=True)
+    """The stop the trade was opened with, written once and never rewritten.
+
+    ``stop_price`` moves as the position is protected, so it cannot serve as the
+    denominator of an R multiple: a trade already ratcheted to break-even would
+    measure its own profit as risk. This is the frozen baseline every R
+    comparison is made against.
+    """
     take_profit_price: Mapped[float | None] = mapped_column(Float, nullable=True)
     trail_percent: Mapped[float | None] = mapped_column(Float, nullable=True)
     trail_price: Mapped[float | None] = mapped_column(Float, nullable=True)

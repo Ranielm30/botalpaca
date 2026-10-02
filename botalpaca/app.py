@@ -579,6 +579,7 @@ class Application:
             symbol=plan.symbol,
             qty=plan.qty,
             entry_price=entry_price,
+            initial_stop_price=plan.stop_loss,
             stop_order_id=stop_leg.id if stop_leg else None,
             take_profit_order_id=tp_leg.id if tp_leg else None,
             order_class=plan.order_class,
