@@ -30,7 +30,12 @@ from botalpaca.domain import (
     TradingEnvironment,
     ValidationError,
 )
-from botalpaca.execution import BrokerError, ExecutionEngine, OrderBuilder
+from botalpaca.execution import (
+    BrokerError,
+    ExecutionEngine,
+    OrderBuilder,
+    order_status_value,
+)
 
 log = get_logger(__name__)
 
@@ -43,6 +48,16 @@ def _type_value(order: OrderState) -> str:
 
 def _is_trailing(order: OrderState) -> bool:
     return _type_value(order) == "trailing_stop"
+
+
+# Order states that reserve the shares but can never execute.
+_INERT_STATUSES = frozenset({"held", "pending_cancel", "pending_replace"})
+
+
+def _is_inert(order: OrderState) -> bool:
+    """True when an order still holds the shares but is not working protection."""
+    status = order_status_value(order)
+    return status in _INERT_STATUSES
 
 
 class PositionProtectionManager:
@@ -68,7 +83,7 @@ class PositionProtectionManager:
     async def get_state(self, environment: TradingEnvironment, symbol: str) -> ProtectionState:
         """Live protection. Alpaca's open orders are the source of truth."""
         symbol = symbol.upper()
-        orders = await self._engine.get_open_orders_for_symbol(symbol)
+        orders = await self._engine.get_live_orders_for_symbol(symbol)
         # Without a live position we assume a long book (the only case where a
         # protective sell leg cannot be mistaken for an entry).
         live = self._state_from_orders(environment, symbol, orders, OrderSide.SELL)
@@ -104,6 +119,12 @@ class PositionProtectionManager:
         for order in orders:
             if order.symbol.upper() != symbol:
                 continue
+            # A HELD order reserves the shares but can never execute. Treating it
+            # as protection is what made the bot believe a stop was in place
+            # while nothing could actually fire.
+            if _is_inert(order):
+                state.inert_order_ids.append(order.id)
+                continue
             kind = _type_value(order)
             if _is_trailing(order):
                 state.has_trailing = True
@@ -133,7 +154,9 @@ class PositionProtectionManager:
     ) -> ProtectionState:
         """Protection state resolved against a known position direction."""
         symbol = position.symbol.upper()
-        orders = await self._engine.get_open_orders_for_symbol(symbol)
+        # Live orders, not just OPEN: a child left in HELD still reserves the
+        # shares and has to be surfaced so it can be cleared.
+        orders = await self._engine.get_live_orders_for_symbol(symbol)
         exit_side = OrderSide.SELL if position.qty >= 0 else OrderSide.BUY
         live = self._state_from_orders(environment, symbol, orders, exit_side)
         async with self._db.session() as session:
@@ -184,6 +207,48 @@ class PositionProtectionManager:
         )
         return await self.get_state(environment, symbol)
 
+    async def _clear_inert_orders(
+        self,
+        environment: TradingEnvironment,
+        position: PositionSnapshot,
+        state: ProtectionState,
+    ) -> list[str]:
+        """Cancel HELD or stuck orders so the shares become available again.
+
+        Returns the ids that could not be cleared, because the caller then knows
+        its replacement exit is likely to be rejected.
+        """
+        if not state.inert_order_ids:
+            return []
+        cleared: list[str] = []
+        stuck: list[str] = []
+        for order_id in state.inert_order_ids:
+            try:
+                await self._engine.cancel_order(order_id, environment=environment)
+                cleared.append(order_id)
+            except Exception as exc:  # noqa: BLE001 - report it, never hide it
+                stuck.append(order_id)
+                log.warning(
+                    "protection.inert_cancel_failed",
+                    environment=environment.value,
+                    symbol=position.symbol,
+                    order_id=order_id,
+                    error=str(exc),
+                )
+        if cleared:
+            state.inert_order_ids = stuck
+            state.notes.append(
+                f"Ordenes inertes canceladas ({len(cleared)}) para liberar las acciones"
+            )
+            log.info(
+                "protection.inert_cleared",
+                environment=environment.value,
+                symbol=position.symbol,
+                cleared=len(cleared),
+                stuck=len(stuck),
+            )
+        return stuck
+
     async def clear(self, environment: TradingEnvironment, symbol: str) -> None:
         async with self._db.session() as session:
             await ProtectionRepository(session).delete(environment, symbol)
@@ -204,6 +269,10 @@ class PositionProtectionManager:
         state = await self.state_for_position(environment, position)
         if state.has_stop:
             return state
+
+        # An inert child still reserves the shares, so Alpaca would reject any
+        # new exit for "insufficient qty available". Clear it first.
+        await self._clear_inert_orders(environment, position, state)
 
         price = stop_price if stop_price is not None else self._fallback_stop(position, atr)
         if price is None:
@@ -312,11 +381,60 @@ class PositionProtectionManager:
                 state.notes.append("El stop ya está en break-even o mejor")
                 return state
 
-        replaced = await self._engine.replace_order(
-            state.stop_order_id,
-            OrderBuilder.build_replace(stop_price=new_stop),
-            environment=environment,
-        )
+        try:
+            replaced = await self._engine.replace_order(
+                state.stop_order_id,
+                OrderBuilder.build_replace(stop_price=new_stop),
+                environment=environment,
+            )
+        except (BotalpacaError, BrokerError, RuntimeError) as exc:
+            # Alpaca refuses to replace an order that is accepted, pending_new,
+            # pending_cancel or pending_replace -- which is exactly the state a
+            # bracket child is in right after the entry fills. Cancel and recreate
+            # so break-even still lands.
+            log.info(
+                "protection.break_even_replace_rejected",
+                environment=environment.value,
+                symbol=position.symbol,
+                error=str(exc),
+            )
+            await self._engine.cancel_order(state.stop_order_id, environment=environment)
+            created = await self._engine.submit_protective(
+                environment=environment,
+                request=OrderBuilder.build_protective_stop(
+                    symbol=position.symbol,
+                    qty=abs(position.qty),
+                    exit_side=position.direction,
+                    stop_price=new_stop,
+                ),
+                symbol=position.symbol,
+            )
+            if created.order is None or not created.order.id:
+                raise ValidationError(
+                    f"No se pudo mover el stop de {position.symbol} a break-even: "
+                    f"Alpaca no confirmo la orden nueva. LA POSICION ESTA SIN STOP"
+                ) from exc
+            await self._persist(
+                environment,
+                position.symbol,
+                stop_order_id=created.order.id,
+                stop_price=new_stop,
+                break_even_active=True,
+            )
+            state.has_stop = True
+            state.stop_order_id = created.order.id
+            state.stop_price = new_stop
+            state.break_even_active = True
+            state.notes.append(f"Stop recreado en break-even ({new_stop})")
+            log.info(
+                "protection.break_even",
+                environment=environment.value,
+                symbol=position.symbol,
+                new_stop=new_stop,
+                method="cancel_recreate",
+            )
+            return state
+
         await self._persist(
             environment,
             position.symbol,
@@ -356,18 +474,35 @@ class PositionProtectionManager:
 
         state = await self.state_for_position(environment, position)
         if state.has_trailing and state.trailing_order_id:
-            replaced = await self._engine.replace_order(
-                state.trailing_order_id,
-                OrderBuilder.build_replace(trail=percent),
-                environment=environment,
-            )
-            await self._persist(
-                environment, position.symbol, trail_percent=percent, trailing_order_id=replaced.id
-            )
-            state.trail_percent = percent
-            state.trailing_order_id = replaced.id
-            state.notes.append(f"Trailing actualizado a {percent}%")
-            return state
+            try:
+                replaced = await self._engine.replace_order(
+                    state.trailing_order_id,
+                    OrderBuilder.build_replace(trail=percent),
+                    environment=environment,
+                )
+            except (BotalpacaError, BrokerError, RuntimeError) as exc:
+                # Same Alpaca rule as break-even: no replace while the order is
+                # accepted/pending_new. Recreate the trailing order instead.
+                log.info(
+                    "protection.trailing_replace_rejected",
+                    environment=environment.value,
+                    symbol=position.symbol,
+                    error=str(exc),
+                )
+                await self._engine.cancel_order(state.trailing_order_id, environment=environment)
+                state.has_trailing = False
+                state.trailing_order_id = None
+            else:
+                await self._persist(
+                    environment,
+                    position.symbol,
+                    trail_percent=percent,
+                    trailing_order_id=replaced.id,
+                )
+                state.trail_percent = percent
+                state.trailing_order_id = replaced.id
+                state.notes.append(f"Trailing actualizado a {percent}%")
+                return state
 
         note = await self._transition_to_trailing(
             environment=environment, position=position, percent=percent
@@ -451,9 +586,14 @@ class PositionProtectionManager:
     ) -> str | None:
         """Swap bracket/OCO legs for a plain stop before adding the trailing stop.
 
-        Order of operations is safety-critical: the replacement stop is submitted
-        and confirmed BEFORE any cancellation. If it fails, nothing is cancelled
-        and the original protection stays intact.
+        Alpaca reserves the shares for every open exit order, so the old legs
+        must be released BEFORE the replacement is created. Submitting first --
+        which this used to do, to avoid a protection gap -- is always rejected
+        with "insufficient qty available", which meant a trailing stop could
+        never be armed on a bracket-protected position. The unavoidable gap is
+        one API round-trip, and if the new stop then fails, the original legs
+        are already gone, so the failure is reported loudly rather than
+        silently leaving the position bare.
         """
         state = await self.state_for_position(environment, position)
         if not (state.has_stop or state.has_take_profit):
@@ -465,6 +605,19 @@ class PositionProtectionManager:
             position.current_price * (1 - offset) if long_position else position.current_price * (1 + offset),
             2,
         )
+
+        stale = [oid for oid in (state.stop_order_id, state.take_profit_order_id) if oid]
+        cancelled: list[str] = []
+        for order_id in stale:
+            try:
+                await self._engine.cancel_order(order_id, environment=environment)
+                cancelled.append(order_id)
+            except Exception as exc:  # noqa: BLE001 - keep trying the rest
+                log.error(
+                    "protection.transition.cancel_failed",
+                    order_id=order_id,
+                    error=str(exc),
+                )
 
         try:
             replacement = await self._engine.submit_protective(
@@ -478,30 +631,17 @@ class PositionProtectionManager:
                 symbol=position.symbol,
             )
         except (BotalpacaError, BrokerError, RuntimeError) as exc:
-            # Nothing has been cancelled yet, so the position keeps its original
-            # protection; report the failure instead of silently degrading.
+            # The old legs are already cancelled, so the position is now bare.
+            # Say so plainly instead of pretending the transition was clean.
             raise ValidationError(
-                f"No se pudo crear el stop de reemplazo de {position.symbol}: {exc}. "
-                "Las protecciones existentes NO fueron tocadas"
+                f"Se cancelaron las protecciones de {position.symbol} pero no se pudo "
+                f"crear el stop de reemplazo: {exc}. LA POSICION ESTA SIN STOP"
             ) from exc
         if replacement.order is None or not replacement.order.id:
             raise ValidationError(
-                f"No se pudo crear el stop de reemplazo de {position.symbol}; "
-                "las protecciones existentes NO fueron tocadas"
+                f"Se cancelaron las protecciones de {position.symbol} pero Alpaca no "
+                f"confirmo el stop de reemplazo. LA POSICION ESTA SIN STOP"
             )
-
-        cancelled: list[str] = []
-        for order_id in (state.stop_order_id, state.take_profit_order_id):
-            if order_id and order_id != replacement.order.id:
-                try:
-                    await self._engine.cancel_order(order_id, environment=environment)
-                    cancelled.append(order_id)
-                except Exception as exc:  # noqa: BLE001 - keep the confirmed replacement
-                    log.error(
-                        "protection.transition.cancel_failed",
-                        order_id=order_id,
-                        error=str(exc),
-                    )
 
         await self._persist(
             environment,
@@ -514,11 +654,11 @@ class PositionProtectionManager:
             order_class=None,
         )
         message = (
-            f"Transición segura a trailing: stop de reemplazo {replacement.order.id} "
-            f"confirmado en {provisional}"
+            f"Stop de reemplazo {replacement.order.id} confirmado en {provisional} "
+            f"para armar el trailing"
         )
         if cancelled:
-            message += f"; legs cancelados: {', '.join(cancelled)}"
+            message += f"; protecciones liberadas primero: {', '.join(cancelled)}"
         return message
 
     # ------------------------------------------------------------------ cancel

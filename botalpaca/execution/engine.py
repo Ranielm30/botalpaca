@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import datetime as dt
 import uuid
+from collections.abc import Sequence
 from typing import Any
 
 from botalpaca.config import get_logger
@@ -34,8 +35,17 @@ from botalpaca.domain import (
     TradingEnvironment,
 )
 from botalpaca.execution.builder import OrderBuilder
-from botalpaca.execution.client import AlpacaTradingClient, BrokerError
+from botalpaca.execution.client import (
+    AlpacaTradingClient,
+    BrokerError,
+    order_status_value,
+)
 from botalpaca.execution.mapping import to_order_state
+
+# Alpaca reports order status as an enum whose repr is ``OrderStatus.NEW``. Only
+# these states are final; everything else may still fill, so it must stay visible
+# when looking for protection.
+_TERMINAL_STATUSES = frozenset({"filled", "canceled", "expired", "replaced", "rejected"})
 
 logger = get_logger(__name__)
 
@@ -388,6 +398,35 @@ class ExecutionEngine:
         orders = await self.get_open_orders(nested=True)
         target = symbol.upper()
         return [o for o in orders if o.symbol == target]
+
+    async def get_live_orders_for_symbol(self, symbol: str) -> list[OrderState]:
+        """Orders for one symbol that can still act, ``HELD`` ones included.
+
+        A bracket child left in ``HELD`` reserves the shares without protecting
+        anything, and it is invisible to an OPEN query. Protection must be able
+        to find and clear it.
+        """
+        orders = await self.get_live_orders(nested=True, symbols=[symbol.upper()])
+        target = symbol.upper()
+        return [o for o in orders if o.symbol == target]
+
+    async def get_live_orders(self, *, nested: bool = True, symbols: Sequence[str] | None = None) -> list[OrderState]:
+        """Orders that can still act, including the ones an OPEN query hides.
+
+        ``QueryOrderStatus`` only offers OPEN, CLOSED and ALL, so a bracket child
+        left in ``HELD`` is invisible to an OPEN query -- yet it still reserves the
+        shares. ``ALL`` is queried and terminal states are dropped here.
+        """
+        from alpaca.trading.enums import QueryOrderStatus
+
+        raw_orders = await self._client.get_orders(
+            status=QueryOrderStatus.ALL, limit=500, nested=nested, symbols=list(symbols) if symbols else None
+        )
+        return [
+            to_order_state(o, self.active_environment)
+            for o in raw_orders
+            if order_status_value(o) not in _TERMINAL_STATUSES
+        ]
 
     # -- helpers -------------------------------------------------------------
 

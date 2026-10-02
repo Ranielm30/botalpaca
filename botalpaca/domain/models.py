@@ -481,6 +481,10 @@ class ProtectionState(Domain):
     break_even_active: bool = False
     time_stop_at: dt.datetime | None = None
     order_class: OrderClass | None = None
+    # Orders that still reserve the shares but cannot execute: a bracket child
+    # left in HELD. They must be cleared before any replacement exit can be
+    # created, or Alpaca rejects the new order for insufficient qty available.
+    inert_order_ids: list[str] = Field(default_factory=list)
     notes: list[str] = Field(default_factory=list)
 
 

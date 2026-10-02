@@ -26,6 +26,11 @@ from botalpaca.domain import TradingEnvironment
 
 logger = get_logger(__name__)
 
+
+def order_status_value(order: Any) -> str:
+    """The lowercase status name of an Alpaca order, enum or plain string."""
+    return str(getattr(order, "status", "")).split(".")[-1].strip().lower()
+
 __all__ = ["AlpacaTradingClient", "BrokerError"]
 
 # Errors worth retrying: transient network/5xx conditions.
@@ -217,7 +222,24 @@ class AlpacaTradingClient:
         await self._run(self.raw.cancel_order_by_id, order_id)
 
     async def cancel_orders(self, *, symbol: str | None = None) -> None:
-        await self._run(self.raw.cancel_orders, symbol=symbol.upper() if symbol else None)
+        """Cancel open orders, optionally narrowed to one symbol.
+
+        Alpaca's ``cancel_orders`` takes no arguments at all and always cancels
+        everything, so a symbol filter has to be resolved here by cancelling each
+        open order individually. Passing the symbol through used to raise
+        ``TypeError`` and broke every cancel path, ``/cancelar`` included.
+        """
+        if symbol is None:
+            await self._run(self.raw.cancel_orders)
+            return
+
+        target = symbol.upper()
+        orders = await self.get_orders(status=QueryOrderStatus.OPEN, symbols=[target])
+        for order in orders:
+            try:
+                await self.cancel_order_by_id(order.id)
+            except Exception:  # noqa: BLE001 - one bad order must not stop the rest
+                logger.warning("cancel_failed", order_id=order.id, symbol=target)
 
     async def replace_order_by_id(self, order_id: str, request: Any) -> Order:
         return await self._run(self.raw.replace_order_by_id, order_id, request)  # type: ignore[no-any-return]

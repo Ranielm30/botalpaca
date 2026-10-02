@@ -200,19 +200,23 @@ async def test_transition_places_provisional_stop_before_cancelling_legs(databas
     await manager.enable_trailing_stop(
         environment=PAPER, position=make_position(entry=100.0, current=102.0), trail_percent=2.0
     )
-    # Protection is never left naked: the replacement stop is confirmed first.
-    assert order[0].startswith("submit:")
-    assert any(e.startswith("cancel:s1") for e in order)
+    # Alpaca reserves the shares for every open exit order, so the replacement
+    # has to be created only after the old legs are released. Submitting first is
+    # rejected outright with "insufficient qty available".
+    assert order[0].startswith("cancel:")
+    assert any(e.startswith("submit:") for e in order)
+    assert any(e == "cancel:s1" for e in order)
 
 
-async def test_transition_aborts_without_touching_anything_on_broker_failure(database):
+async def test_transition_reports_a_bare_position_when_the_replacement_fails(database):
+    """The old legs are already cancelled, so failure must be stated, not hidden."""
     manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0), _tp_order("t1")])
     client.submit_error = BrokerError("broker down", status_code=500)
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValidationError) as excinfo:
         await manager.enable_trailing_stop(
             environment=PAPER, position=make_position(entry=100.0, current=102.0), trail_percent=2.0
         )
-    assert not client.cancelled  # the old bracket legs are untouched
+    assert "SIN STOP" in str(excinfo.value)
 
 
 async def test_trailing_stop_uses_atr_when_larger(database):

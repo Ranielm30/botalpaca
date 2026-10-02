@@ -1,7 +1,7 @@
 """Execution layer: Alpaca adapter, order builder, and the Execution Engine."""
 
 from .builder import OrderBuilder, alpaca_order_class, alpaca_side, alpaca_tif, alpaca_type
-from .client import AlpacaTradingClient, BrokerError
+from .client import AlpacaTradingClient, BrokerError, order_status_value
 from .engine import (
     ACTION_CANCEL,
     ACTION_CLOSE,
@@ -30,6 +30,7 @@ __all__ = [
     "STATUS_REJECTED",
     "STATUS_SUBMITTED",
     "AlpacaTradingClient",
+    "order_status_value",
     "BrokerError",
     "ExecutionEngine",
     "OrderBuilder",
