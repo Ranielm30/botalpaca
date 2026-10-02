@@ -274,6 +274,46 @@ class PositionProtectionManager:
         # new exit for "insufficient qty available". Clear it first.
         await self._clear_inert_orders(environment, position, state)
 
+        # Alpaca reserves the shares for every open exit order, so a live
+        # take-profit blocks a stop on the very same position. Alpaca will not
+        # let two independent sell orders coexist, and it refuses an OTO whose
+        # legs sit on opposite sides of the primary price, which is exactly the
+        # long geometry of stop-below / target-above. The stop is the only exit
+        # that can be kept alive here, and an unprotected position is worse than
+        # one without a target: the target is recoverable by raising the stop as
+        # the trade works, a loss is not. So the take-profit is released.
+        if state.take_profit_order_id:
+            try:
+                await self._engine.cancel_order(
+                    state.take_profit_order_id, environment=environment
+                )
+            except (BotalpacaError, BrokerError, RuntimeError) as exc:
+                log.warning(
+                    "protection.target_release_failed",
+                    environment=environment.value,
+                    symbol=position.symbol,
+                    error=str(exc),
+                )
+                raise ValidationError(
+                    f"No se puede proteger {position.symbol}: su take-profit sigue "
+                    f"retendiendo las acciones y no se pudo cancelar ({exc}). "
+                    f"LA POSICION ESTA SIN STOP"
+                ) from exc
+            state.notes.append(
+                "Take-profit liberado: Alpaca reserva las acciones por orden y "
+                "no admite stop y target a la vez"
+            )
+            log.warning(
+                "protection.target_released_for_stop",
+                environment=environment.value,
+                symbol=position.symbol,
+                take_profit_order_id=state.take_profit_order_id,
+                take_profit_price=state.take_profit_price,
+            )
+            state.has_take_profit = False
+            state.take_profit_order_id = None
+            state.take_profit_price = None
+
         price = stop_price if stop_price is not None else self._fallback_stop(position, atr)
         if price is None:
             raise ValidationError(
