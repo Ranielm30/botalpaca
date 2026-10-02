@@ -12,7 +12,9 @@ authors = [{ name = "Ranielm30" }]
 dependencies = [
     "alpaca-py==0.44.0",
     "python-telegram-bot>=21.10",
-    "SQLAlchemy>=2.0.36",
+    # The [asyncio] extra pulls in greenlet, which SQLAlchemy's async engine
+    # requires at import time. Without it the container dies on startup.
+    "SQLAlchemy[asyncio]>=2.0.36",
     "alembic>=1.14",
     "pydantic>=2.9",
     "pydantic-settings>=2.6",
@@ -24,6 +26,9 @@ dependencies = [
     "apscheduler>=3.10",
     "orjson>=3.10",
     "tzdata",
+    # aiosqlite is the async driver for the SQLite persistence layer, so it is
+    # a runtime dependency, not a test-only one.
+    "aiosqlite>=0.20",
 ]
 
 [project.optional-dependencies]
@@ -34,7 +39,6 @@ dev = [
     "respx>=0.22",
     "ruff>=0.8",
     "mypy>=1.13",
-    "aiosqlite>=0.20",
 ]
 
 [project.scripts]

@@ -39,7 +39,7 @@ def _banner(account: object, environment: object) -> str:
 
 async def _check(settings: Settings) -> int:
     """Validate configuration, credentials and database, then exit."""
-    configure_logging(settings.log_level, settings.log_json)
+    configure_logging(level=settings.log_level, json_output=settings.log_json)
     app = Application(settings)
     try:
         account = await app.start()
@@ -61,7 +61,7 @@ async def _check(settings: Settings) -> int:
 
 
 async def _run(settings: Settings) -> int:
-    configure_logging(settings.log_level, settings.log_json)
+    configure_logging(level=settings.log_level, json_output=settings.log_json)
     if not settings.telegram_enabled:
         print(
             "TELEGRAM_BOT_TOKEN no está configurado. Usa --check para validar "

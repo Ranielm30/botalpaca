@@ -14,6 +14,13 @@
 app = "botalpaca"
 primary_region = "iad"
 
+# The bot is a worker, not a request-serving service: it never receives traffic
+# and has nothing to serve, so Fly must not auto-stop it after idle time. Without
+# this the machine is suspended whenever the Telegram poller happens to be quiet,
+# which would pause the market monitor and the position-protection reconciler.
+auto_stop_machines = false
+auto_start_machines = true
+
 # ----------------------------------------------------------------- build
 [build]
   dockerfile = "Dockerfile"
