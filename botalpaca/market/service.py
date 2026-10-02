@@ -42,6 +42,23 @@ __all__ = [
     "to_quote",
 ]
 
+#: Headroom over the theoretical span, so weekends, holidays and halts do not
+#: leave the last few bars short of the requested count.
+_HISTORY_HEADROOM = 2.5
+
+
+def _default_start(bar_minutes: int, limit: int) -> dt.datetime:
+    """Earliest timestamp needed to obtain ``limit`` bars of this timeframe.
+
+    Alpaca's ``/v2/stocks/bars`` endpoint does NOT honour ``limit`` on its own:
+    a request with ``limit=300`` and no ``start`` returns a single bar. Every
+    call must therefore carry an explicit window, so this derives one from the
+    bar size and the requested count. Without it the whole scanner silently
+    analysed nothing.
+    """
+    minutes = max(1, bar_minutes) * max(1, limit) * _HISTORY_HEADROOM
+    return dt.datetime.now(dt.UTC) - dt.timedelta(minutes=minutes)
+
 # Minutes per unit, used to decide how much history a timeframe needs.
 _UNIT_MINUTES: dict[str, int] = {
     TimeFrameUnit.Minute.value: 1,
@@ -239,7 +256,7 @@ class MarketDataService:
             symbol_or_symbols=symbol.upper(),
             timeframe=TimeFrame(tf.amount, tf.unit),
             limit=limit,
-            start=start,
+            start=start if start is not None else _default_start(tf.minutes, limit),
             end=end,
             adjustment=adjustment,
             feed=self.feed,
@@ -262,6 +279,7 @@ class MarketDataService:
             symbol_or_symbols=upper,
             timeframe=TimeFrame(tf.amount, tf.unit),
             limit=limit,
+            start=_default_start(tf.minutes, limit),
             adjustment=Adjustment.SPLIT,
             feed=self.feed,
         )

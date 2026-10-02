@@ -6,6 +6,7 @@ touches the network, so the whole Telegram surface is testable offline.
 
 from __future__ import annotations
 
+import datetime as dt
 from types import SimpleNamespace
 from typing import Any
 
@@ -810,8 +811,37 @@ def test_authorization_error_is_a_botalpaca_error():
 
 
 # -- PTB adapter ---------------------------------------------------------------------
+def test_bar_requests_always_carry_an_explicit_window():
+    """Alpaca ignores `limit` when `start` is absent and returns ONE bar.
+
+    That made every scan come back empty while looking healthy, so the request
+    builder must always send a start derived from the bar size and the count.
+    """
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+    from botalpaca.market.service import _default_start, parse_timeframe
+
+    start = _default_start(1440, 300)
+    assert start < dt.datetime.now(dt.UTC)
+
+    # A daily request for 300 bars must look back further than an hourly one.
+    daily = parse_timeframe("1D").minutes
+    hourly = parse_timeframe("1h").minutes
+    assert _default_start(daily, 300) < _default_start(hourly, 300)
+
+    # The same window is used when the caller passes no start.
+    request = StockBarsRequest(
+        symbol_or_symbols="AAPL",
+        timeframe=TimeFrame(1, TimeFrameUnit.Day),
+        limit=300,
+        start=_default_start(daily, 300),
+    )
+    assert request.start is not None
+
+
 def test_build_telegram_application_is_constructible():
-    """The PTB adapter must build against the *installed* python-telegram-bot.
+    """The PTB adapter must build against the installed python-telegram-bot.
 
     `ApplicationBuilder` exposes neither `.parse_mode()` nor
     `.drop_pending_updates()`; guessing those method names produced an
