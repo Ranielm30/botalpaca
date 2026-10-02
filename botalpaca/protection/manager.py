@@ -366,12 +366,14 @@ class PositionProtectionManager:
     ) -> ProtectionState:
         """Guarantee a stop exists. Places a real order when missing."""
         state = await self.state_for_position(environment, position)
+        # An inert child still reserves the shares even when the position looks
+        # protected, so Alpaca rejects every future exit for "insufficient qty
+        # available". Clearing it is not optional just because a live stop
+        # exists: the shares stay locked for the rest of the trade otherwise.
+        if state.inert_order_ids:
+            await self._clear_inert_orders(environment, position, state)
         if state.has_stop:
             return state
-
-        # An inert child still reserves the shares, so Alpaca would reject any
-        # new exit for "insufficient qty available". Clear it first.
-        await self._clear_inert_orders(environment, position, state)
 
         # Alpaca reserves the shares for every open exit order, so a live
         # take-profit blocks a stop on the very same position. Alpaca will not
@@ -1029,6 +1031,18 @@ class PositionProtectionManager:
 
         for symbol, position in sorted(live.items()):
             state = await self.state_for_position(environment, position)
+            # An inert order reserves the shares without protecting anything,
+            # which locks out every future exit on this position. It can outlive
+            # the protection that created it, so it is swept here too.
+            if state.inert_order_ids:
+                blocked = await self._clear_inert_orders(environment, position, state)
+                if blocked:
+                    notes.append(
+                        f"🚨 {symbol}: {len(blocked)} orden(es) inertes retienen las "
+                        "acciones y no se pudieron cancelar"
+                    )
+                else:
+                    notes.append(f"🧹 {symbol}: ordenes inertes liberadas")
             if not state.has_stop:
                 if not auto:
                     notes.append(f"⚠️ {symbol}: posición abierta SIN stop en Alpaca")
