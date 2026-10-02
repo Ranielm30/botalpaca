@@ -104,7 +104,7 @@ def test_pending_and_filled_live_side_by_side():
     assert PENDING_LABEL in text
     assert "NVDA" in text
     assert "AAPL" in text
-    assert "no realizado" in text
+    assert "Total acumulado" in text
 
 
 def test_empty_screen_still_says_so():

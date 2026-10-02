@@ -1597,7 +1597,16 @@ class TelegramFacade:
     # ------------------------------------------------------------------ alerts
 
     async def handle_alert(self, payload: object) -> None:
-        """Render a monitor alert into the allowed chat(s)."""
+        """Render a monitor alert into the allowed chat(s).
+
+        A payload may also be a finished card in its own right: the autonomous
+        protector composes and renders its own text, so there is nothing left to
+        format and it is sent as it stands.
+        """
+        if isinstance(payload, str):
+            await self.app.notifications.send(payload, force=True)
+            return
+
         opportunities = getattr(payload, "opportunities", ()) or ()
         alerts = getattr(payload, "alerts", ()) or ()
         environment = getattr(payload, "environment", self.environment)

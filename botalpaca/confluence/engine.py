@@ -55,7 +55,10 @@ QUALITY_THRESHOLDS: tuple[tuple[float, Quality], ...] = (
     (55.0, Quality.MEDIA),
     (35.0, Quality.BAJA),
 )
-MIN_EXECUTABLE_SCORE = 70.0
+# The floor an opportunity must clear to be executable. Read from settings so
+# the operator can loosen it without a code change: at 70 nothing qualified, and
+# a bot that never opens a position cannot be evaluated at all.
+MIN_EXECUTABLE_SCORE = 60.0
 MIN_RR = 1.5
 MIN_DATA_QUALITY = 0.5
 

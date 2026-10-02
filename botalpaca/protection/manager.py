@@ -225,14 +225,50 @@ class PositionProtectionManager:
         )
         return await self.get_state(environment, symbol)
 
+    async def _submit_exit(
+        self,
+        environment: TradingEnvironment,
+        symbol: str,
+        request: object,
+        *,
+        ignore: Sequence[str] = (),
+    ):
+        """Send an exit order, retrying once the broker frees the shares.
+
+        Alpaca reserves the shares for every open exit order. Even after the old
+        leg is cancelled the create can still land while the release is in
+        flight, and it comes back as ``insufficient qty available ... naming the
+        order that was just cancelled``. Without this the trailing handover
+        never arms and the position keeps a stop the operator thinks has been
+        replaced.
+        """
+        for attempt in range(2):
+            try:
+                return await self._engine.submit_protective(
+                    environment=environment,
+                    request=request,
+                    symbol=symbol,
+                )
+            except (BrokerError, BotalpacaError, RuntimeError) as exc:
+                if "insufficient qty" not in str(exc) or attempt:
+                    raise
+                log.info(
+                    "protection.exit_resubmitting",
+                    environment=environment.value,
+                    symbol=symbol,
+                    error=str(exc),
+                )
+                await self._await_shares_free(environment, symbol, ignore=ignore)
+        return None
+
     async def _await_shares_free(
         self,
         environment: TradingEnvironment,
         symbol: str,
         *,
         ignore: Sequence[str] = (),
-        attempts: int = 8,
-        delay: float = 0.4,
+        attempts: int = 30,
+        delay: float = 0.5,
     ) -> bool:
         """Wait until Alpaca stops counting a cancelled order as held.
 
@@ -244,7 +280,11 @@ class PositionProtectionManager:
         a protection swap that works and one that appears to.
         """
         skip = set(ignore)
-        for attempt in range(attempts):
+        # Alpaca's release is asynchronous and its latency is not published. A
+        # fixed 3.2s budget lost the race on the live box, so the ceiling is
+        # generous and the delay backs off instead of hammering the API.
+        ceiling = max(attempts, 1)
+        for attempt in range(ceiling):
             try:
                 orders = await self._engine.get_live_orders_for_symbol(symbol)
             except (BotalpacaError, BrokerError, RuntimeError) as exc:
@@ -263,7 +303,7 @@ class PositionProtectionManager:
                 if not held:
                     return True
             if attempt < attempts - 1:
-                await asyncio.sleep(delay)
+                await asyncio.sleep(min(delay * (1.5 ** attempt), 2.5))
         return False
 
     async def _clear_inert_orders(
@@ -383,7 +423,7 @@ class PositionProtectionManager:
         await self._await_shares_free(
             environment, position.symbol, ignore=state.inert_order_ids
         )
-        result = await self._engine.submit_protective(
+        result = await self._submit_exit(
             environment=environment,
             request=OrderBuilder.build_protective_stop(
                 symbol=position.symbol,
@@ -565,7 +605,7 @@ class PositionProtectionManager:
             await self._await_shares_free(
                 environment, position.symbol, ignore=state.inert_order_ids
             )
-            created = await self._engine.submit_protective(
+            created = await self._submit_exit(
                 environment=environment,
                 request=OrderBuilder.build_protective_stop(
                     symbol=position.symbol,
@@ -717,7 +757,7 @@ class PositionProtectionManager:
         if note:
             state.notes.append(note)
 
-        result = await self._engine.submit_protective(
+        result = await self._submit_exit(
             environment=environment,
             request=OrderBuilder.build_trailing_stop(
                 symbol=position.symbol,
@@ -830,7 +870,7 @@ class PositionProtectionManager:
         # old legs to actually go terminal before asking for the replacement.
         await self._await_shares_free(environment, position.symbol)
         try:
-            replacement = await self._engine.submit_protective(
+            replacement = await self._submit_exit(
                 environment=environment,
                 request=OrderBuilder.build_protective_stop(
                     symbol=position.symbol,

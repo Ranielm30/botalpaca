@@ -514,7 +514,18 @@ class Application:
         )
 
     async def notify_position_alert(self, alert: PositionAlert) -> None:
+        """Deliver one position-level notice.
+
+        The autonomous protector has already composed and rendered its own card,
+        so it hands over a plain string rather than a ``PositionAlert``. Routing
+        that through the alert pipeline silently lost every autonomous action --
+        break-even, trailing, progressive and the emergency stop all applied but
+        never reached Telegram.
+        """
         if self._alert_handler is None:
+            return
+        if isinstance(alert, str):
+            await self._alert_handler(alert)
             return
         await self._alert_handler(
             OpportunityAlert(environment=self.active_environment, opportunities=(), alerts=(alert,))

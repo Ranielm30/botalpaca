@@ -87,9 +87,12 @@ def test_render_positions_empty():
 def test_render_positions_shows_each_block():
     positions = [_Position("AAPL"), _Position("TSLA", entry=200.0, current=210.0, pl=100.0, plpc=0.05)]
     out = render_positions(positions, PAPER)
-    assert "1. AAPL" in out
-    assert "2. TSLA" in out
-    assert fmt.RULE_THIN in out
+    assert "AAPL" in out and "LONG" in out
+    assert "TSLA" in out
+    # The reference layout puts one divider above the accumulated total.
+    assert fmt.RULE in out
+    assert "Entrada:" in out and "Actual:" in out
+    assert "Total acumulado" in out
 
 
 def test_render_positions_marks_unprotected():

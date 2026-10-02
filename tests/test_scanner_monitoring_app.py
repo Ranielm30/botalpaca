@@ -62,9 +62,15 @@ def test_budget_limits_per_hour():
 def test_render_opportunity_contains_score_and_levels():
     text = render_opportunity(make_opportunity(), environment=PAPER)
     assert "AAPL" in text
-    assert "PAPER" in text
-    assert "R:R" in text or "R:R" in text.upper()
-    assert "Score" in text or "score" in text
+    assert "LONG" in text
+    assert "R:R" in text
+    assert "score" in text.lower()
+    # The reference card leads with what fired, then the three levels.
+    assert "Oportunidad detectada" in text
+    assert "Entry" in text
+    assert "SL" in text
+    assert "TP" in text
+    assert "Riesgo" in text
 
 
 def test_render_real_warning_is_explicit():

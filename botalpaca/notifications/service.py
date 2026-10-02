@@ -31,13 +31,24 @@ if TYPE_CHECKING:  # pragma: no cover - typing only, avoids a layer cycle
 from botalpaca.notifications import format as fmt
 from botalpaca.notifications.format import (
     ARROW,
+    BELL,
+    BRAIN,
+    BULB,
     BULL,
     CHART,
     CLOCK,
+    DOWN,
+    ENTRY,
+    FLAG,
     INFO,
+    PIN,
+    ROCKET,
+    SCALE,
     SHIELD,
     TARGET,
+    UP,
     WARN,
+    YELLOW,
 )
 
 log = get_logger(__name__)
@@ -105,30 +116,50 @@ class NotificationBudget:
 
 
 def render_opportunity(opportunity: Opportunity, *, environment: TradingEnvironment) -> str:
-    """Compact card used by /analizar and the background market monitor."""
+    """The card the operator reads when deciding whether to take a trade.
+
+    Shaped like the reference he supplied: what fired, which symbol and in which
+    direction, the three levels, the risk in a single line, and then the
+    reasoning in italics so the numbers stay scannable on a phone.
+    """
+    quality = opportunity.quality.value.upper()
+    risk_pct = 0.0
+    if opportunity.entry and opportunity.stop:
+        risk_pct = abs(opportunity.entry - opportunity.stop) / opportunity.entry * 100.0
+    arrow = UP if opportunity.direction.name == "LONG" else DOWN
+
     lines = [
-        f"{env_badge(environment)} <b>{opportunity.symbol}</b> · {opportunity.strategy.value}",
-        f"Dirección: {opportunity.direction.name}",
-        f"TF: {opportunity.timeframe} · Régimen: {opportunity.regime.value}",
-        f"Precio: {money(opportunity.entry)}",
-        f"Stop: {money(opportunity.stop)}  |  Target: {money(opportunity.target)}",
-        f"R:R: {opportunity.rr:.2f}",
-        f"Score: <b>{opportunity.score:.0f}</b>/100 · Calidad: {opportunity.quality.value}",
+        f"{BELL} <b>Oportunidad detectada automaticamente</b>",
+        "",
+        f"{BRAIN} {fmt.esc(opportunity.strategy.value)} — [SPOT]",
+        f"{fmt.esc(opportunity.symbol)} {arrow} {opportunity.direction.name}"
+        f"  ·  {fmt.QUALITY_GLYPH.get(quality, YELLOW)} {quality}"
+        f"  ·  STAR score {opportunity.score:.0f}",
+        f"{ENTRY} Entry {money(opportunity.entry)}",
+        f"{SHIELD} SL {money(opportunity.stop)}",
+        f"{FLAG} TP {money(opportunity.target)}",
+        f"{WARN} Riesgo {risk_pct:.2f}%  ·  {SCALE} R:R {opportunity.rr:.2f}",
     ]
+
+    reasoning = list(opportunity.reasons[:3])
     if opportunity.confluences:
-        lines.append("Confluencias: " + ", ".join(opportunity.confluences[:6]))
-    if opportunity.reasons:
-        lines.append("Razones: " + "; ".join(opportunity.reasons[:3]))
+        reasoning.append("Confluencias: " + ", ".join(opportunity.confluences[:4]))
     hist = opportunity.historical or {}
     sample = int(hist.get("sample_size") or 0)
     if sample:
-        lines.append(
-            f"Histórico similar: n={sample}, win rate {float(hist.get('win_rate') or 0):.0%}, "
+        reasoning.append(
+            f"Historico similar: n={sample}, acierto {float(hist.get('win_rate') or 0):.0%}, "
             f"R medio {float(hist.get('average_r') or 0):+.2f}"
         )
     if not opportunity.tradable:
-        lines.append(f"⛔ NO OPERABLE: {opportunity.non_tradable_reason or 'reglas de riesgo'}")
+        reasoning.append(
+            f"NO OPERABLE: {opportunity.non_tradable_reason or 'reglas de riesgo'}"
+        )
+    if reasoning:
+        lines.append(f"{BULB} <i>{fmt.esc('; '.join(reasoning))}</i>")
+
     return "\n".join(lines)
+
 
 
 def render_trade_plan(
@@ -193,7 +224,16 @@ def render_account(account: AccountSnapshot) -> str:
 
 # An entry waiting on the market open is not a position yet, and saying so
 # plainly is better than showing a zero P&L that looks like a flat trade.
+# Maps the confluence quality to a colour square, as in the reference card.
+_QUALITY_GLYPH = fmt.QUALITY_GLYPH
+
 PENDING_LABEL = "PENDIENTE"
+
+
+def _side_label(side: object) -> str:
+    """Buy/sell and long/short mean the same thing; show LONG the way a human does."""
+    value = str(getattr(side, "value", side)).strip().upper()
+    return "SHORT" if value in {"SELL", "SHORT", "SELL_SHORT"} else "LONG"
 
 
 def render_positions(
@@ -245,7 +285,7 @@ def render_positions(
             if opened is not None:
                 lines.append(fmt.row("Enviada", opened.strftime("%d/%m %H:%M UTC")))
             lines.append(
-                f"  {INFO} Se ejecutara sola al abrir. No cuenta todavia como posicion."
+                f"  {CLOCK} {fmt.esc('Se ejecutara sola al abrir. No cuenta todavia como posicion.')}"
             )
 
     if not positions:
@@ -257,29 +297,34 @@ def render_positions(
         return "\n".join(lines)
 
     total = 0.0
-    for index, p in enumerate(positions, start=1):
+    for p in positions:
         total += p.unrealized_pl or 0.0
         state = (protection or {}).get(p.symbol)
-        lines.append("")
-        lines.append(f"<b>{index}. {fmt.esc(p.symbol)}</b>  ·  {fmt.esc(p.side)}  ·  {abs(p.qty):g} acciones")
-        lines.append(fmt.RULE_THIN)
-        lines.append(fmt.row("Entrada", money(p.avg_entry_price)))
-        lines.append(fmt.row("Precio actual", money(p.current_price)))
-        pl = p.unrealized_pl or 0.0
         change = p.unrealized_plpc
+        pl = p.unrealized_pl or 0.0
+        # One line per position, in the shape the operator reads fastest:
+        # what it is, what it cost, what it is worth now, what it returned.
+        lines.append("")
         lines.append(
-            f"{fmt.trend_glyph(change)} P&amp;L  {ARROW}  <b>{money(pl)}</b> "
-            f"({pct_auto(change)})"
+            f"{fmt.trend_glyph(change)} <b>{fmt.esc(p.symbol)}</b>  ·  "
+            f"{_side_label(p.side)}"
         )
-        lines.append(fmt.row("Valor", money(p.market_value)))
+        lines.append(f"Entrada: {money(p.avg_entry_price)}")
+        lines.append(f"Actual: {money(p.current_price)}")
+        lines.append(
+            f"{'✅' if change >= 0 else '🔻'} P&amp;nL: <b>{pct_auto(change)}</b> "
+            f"({money(pl)})"
+        )
         if state is not None:
             lines.append(_protection_line(state))
         else:
-            lines.append(f"  {BULL} {WARN} Proteccion: sin dato")
+            lines.append(f"{WARN} Proteccion: sin dato")
     lines.append("")
     lines.append(fmt.RULE)
-    lines.append(f"{'P&amp;L no realizado'}: <b>{money(total)}</b>")
-    lines.append(f"{CHART} Pulsa un boton para operar sobre esa posicion.")
+    lines.append(
+        f"{'✅' if total >= 0 else '🔻'} Total acumulado: <b>{money(total)}</b>"
+    )
+    lines.append(f"{ROCKET} Toca la posicion para operarla, o {PIN} /analizar para ver oportunidades.")
     return "\n".join(lines)
 
 
