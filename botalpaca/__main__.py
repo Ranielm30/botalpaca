@@ -19,7 +19,12 @@ from botalpaca.config.settings import Settings, get_settings
 from botalpaca.domain.errors import BotalpacaError, ConfigurationError
 from botalpaca.notifications import render_account
 from botalpaca.scheduler import Scheduler
-from botalpaca.telegram import TelegramFacade, build_telegram_application, register_handlers
+from botalpaca.telegram import (
+    TelegramFacade,
+    build_telegram_application,
+    publish_commands,
+    register_handlers,
+)
 
 log = get_logger(__name__)
 
@@ -104,6 +109,8 @@ async def _run(settings: Settings) -> int:
     # `run_polling`). Without this line the process runs happily, connects to
     # Alpaca and serves nothing, because no one ever calls getUpdates.
     await bot_app.updater.start_polling(drop_pending_updates=False)
+    # Publish the command list so typing "/" suggests every command.
+    await publish_commands(bot_app.bot)
     await bot_app.start()
     await scheduler.start()
 

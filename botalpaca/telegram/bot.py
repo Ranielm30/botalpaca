@@ -6,7 +6,9 @@ button) and delegates every decision to :class:`~botalpaca.telegram.service.Tele
 
 from __future__ import annotations
 
-from telegram import Update
+import inspect
+
+from telegram import BotCommand, Update
 from telegram.constants import ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
@@ -98,7 +100,14 @@ async def _dispatch(
 def _make_command(name: str, method_name: str):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         facade: TelegramFacade = context.application.bot_data["facade"]
-        await _dispatch(update, context, getattr(facade, method_name), args=_args(context))
+        method = getattr(facade, method_name)
+        # Only forward `args` when the command actually accepts it. `/start`,
+        # `/help` and `/status` take no arguments, and passing them anyway made
+        # every one of those commands fail with a TypeError.
+        extra: dict[str, object] = {}
+        if "args" in inspect.signature(method).parameters:
+            extra["args"] = _args(context)
+        await _dispatch(update, context, method, **extra)
 
     return handler
 
@@ -133,11 +142,62 @@ def register_handlers(bot_app: TelegramApplication, facade: TelegramFacade) -> N
         "config": "config",
         "reconciliar": "reconciliar",
     }
+    bot_app.bot_data["commands"] = commands
     for command, method in commands.items():
         bot_app.add_handler(CommandHandler(command, _make_command(command, method)))
 
     bot_app.add_handler(CallbackQueryHandler(_on_callback))
     bot_app.add_error_handler(_on_error)
+
+
+# Telegram shows these in the command picker as soon as the user types "/", so
+# nobody has to memorise the command list. Descriptions are shown by clients that
+# support the newer BotCommandScope features and ignored by older ones.
+COMMAND_DESCRIPTIONS: dict[str, str] = {
+    "start": "Bienvenida y estado del bot",
+    "help": "Índice de todos los comandos",
+    "status": "Salud: base de datos, Alpaca, scheduler, kill switch",
+    "modo": "Ver o cambiar entre ALPACA PAPER y ALPACA REAL",
+    "analizar": "Analizar símbolos o escanear el universo",
+    "oportunidades": "Últimas oportunidades detectadas",
+    "detalles": "Detalle completo de un símbolo",
+    "riesgo": "Límites de riesgo y exposición actual",
+    "cuenta": "Equity, cash, buying power y valor de cartera",
+    "portfolio": "Exposiciones y P&L no realizado",
+    "posiciones": "Posiciones abiertas con su protección",
+    "ordenes": "Órdenes abiertas",
+    "comprar": "Proponer una compra (requiere confirmación)",
+    "vender": "Proponer una venta (requiere confirmación)",
+    "cerrar": "Cerrar una posición (requiere confirmación)",
+    "cancelar": "Cancelar una orden o la confirmación pendiente",
+    "modificar": "Reemplazar cantidad, stop o límite de una orden",
+    "stats": "Estadísticas históricas del entorno activo",
+    "historial": "Operaciones cerradas",
+    "explicar": "Por qué el bot recomendó un símbolo",
+    "aprender": "Recomendaciones del motor estadístico",
+    "monitor": "Activar o pausar los monitores en segundo plano",
+    "config": "Configuración efectiva (sin secretos)",
+    "reconciliar": "Reconciliar SQLite contra Alpaca ahora",
+}
+
+
+async def publish_commands(bot: object) -> int:
+    """Publish the command list to Telegram so `/` shows every command.
+
+    Returns the number of commands published. Failures are logged and swallowed:
+    a bot that cannot publish its menu must still run.
+    """
+    commands = [
+        BotCommand(command=command, description=description)
+        for command, description in COMMAND_DESCRIPTIONS.items()
+    ]
+    try:
+        await bot.set_my_commands(commands)
+    except TelegramError:
+        log.warning("telegram.set_commands_failed", exc_info=True)
+        return 0
+    log.info("telegram.commands_published", count=len(commands))
+    return len(commands)
 
 
 # ------------------------------------------------------------------ callbacks

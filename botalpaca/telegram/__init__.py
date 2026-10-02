@@ -1,6 +1,6 @@
 """Telegram interface layer (layer 1 of the architecture)."""
 
-from .bot import build_telegram_application, register_handlers
+from .bot import build_telegram_application, publish_commands, register_handlers
 from .keyboards import (
     ACCEPT_SIGNAL,
     BREAK_EVEN,
@@ -49,6 +49,7 @@ __all__ = [
     "CommandResult",
     "TelegramFacade",
     "build_telegram_application",
+    "publish_commands",
     "register_handlers",
     "confirm_keyboard",
     "env_confirm_keyboard",

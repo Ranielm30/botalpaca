@@ -918,3 +918,94 @@ async def test_answer_splits_long_messages(monkeypatch):
 
     assert len(sent) == 3
     assert sent[0][0] == 7
+
+
+# -- command list published to Telegram ------------------------------------------------
+def test_every_command_has_a_description():
+    """Typing "/" must suggest every command the bot answers to."""
+    from botalpaca.telegram.bot import COMMAND_DESCRIPTIONS, build_telegram_application, register_handlers
+
+    app = build_telegram_application("123456:AAHunit-test-token")
+    register_handlers(app, None)
+    handled = set(app.bot_data["commands"])
+
+    assert handled == set(COMMAND_DESCRIPTIONS), (
+        f"missing: {handled - set(COMMAND_DESCRIPTIONS)}; "
+        f"extra: {set(COMMAND_DESCRIPTIONS) - handled}"
+    )
+    assert all(d.strip() for d in COMMAND_DESCRIPTIONS.values())
+    assert all(len(d) <= 256 for d in COMMAND_DESCRIPTIONS.values())
+
+
+async def test_publish_commands_sends_the_menu():
+    published: list[list[object]] = []
+
+    class _Bot:
+        async def set_my_commands(self, commands: list[object]) -> None:
+            published.append(commands)
+
+    from botalpaca.telegram.bot import COMMAND_DESCRIPTIONS, publish_commands
+
+    count = await publish_commands(_Bot())
+
+    assert count == len(COMMAND_DESCRIPTIONS)
+    assert len(published) == 1
+    assert {c.command for c in published[0]} == set(COMMAND_DESCRIPTIONS)
+
+
+async def test_publish_commands_survives_a_telegram_error():
+    from telegram.error import TelegramError
+
+    from botalpaca.telegram.bot import publish_commands
+
+    class _Bot:
+        async def set_my_commands(self, commands: list[object]) -> None:
+            raise TelegramError("nope")
+
+    assert await publish_commands(_Bot()) == 0
+
+
+def test_run_publishes_commands_at_startup():
+    import inspect
+
+    from botalpaca import __main__
+
+    assert "publish_commands" in inspect.getsource(__main__._run)
+
+
+async def test_commands_without_args_are_not_given_any():
+    """`/start`, `/help` and `/status` take no args; forwarding one broke them."""
+    from types import SimpleNamespace
+
+    from botalpaca.telegram.bot import _make_command
+
+    seen: dict[str, object] = {}
+
+    async def _noop_send(*args: object, **kwargs: object) -> None:
+        return None
+
+    class _Facade:
+        async def guard(self, method, update, **kwargs):
+            seen["kwargs"] = kwargs
+            return SimpleNamespace(text="ok", keyboard=None)
+
+        async def start(self, update: object) -> str:
+            seen["called"] = "start"
+            return "ok"
+
+        async def modo(self, update: object, args: str | None = None) -> str:
+            seen["args"] = args
+            return "ok"
+
+    context = SimpleNamespace(
+        args=["PAPER"],
+        application=SimpleNamespace(bot_data={"facade": _Facade()}),
+        bot=SimpleNamespace(send_message=_noop_send),
+    )
+    update = SimpleNamespace(effective_chat=SimpleNamespace(id=1))
+
+    for method_name, expects_args in (("start", False), ("modo", True)):
+        seen.clear()
+        handler = _make_command(method_name, method_name)
+        await handler(update, context)
+        assert seen.get("kwargs") == ({"args": "PAPER"} if expects_args else {})
