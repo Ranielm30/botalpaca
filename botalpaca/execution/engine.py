@@ -406,21 +406,28 @@ class ExecutionEngine:
         anything, and it is invisible to an OPEN query. Protection must be able
         to find and clear it.
         """
-        orders = await self.get_live_orders(nested=True, symbols=[symbol.upper()])
+        orders = await self.get_live_orders(symbols=[symbol.upper()])
         target = symbol.upper()
         return [o for o in orders if o.symbol == target]
 
-    async def get_live_orders(self, *, nested: bool = True, symbols: Sequence[str] | None = None) -> list[OrderState]:
+    async def get_live_orders(self, *, symbols: Sequence[str] | None = None) -> list[OrderState]:
         """Orders that can still act, including the ones an OPEN query hides.
 
         ``QueryOrderStatus`` only offers OPEN, CLOSED and ALL, so a bracket child
         left in ``HELD`` is invisible to an OPEN query -- yet it still reserves the
         shares. ``ALL`` is queried and terminal states are dropped here.
+
+        ``nested`` must stay off. Verified against the PAPER API: the same query
+        returns 38 rows including the HELD order unnested, and 18 rows with zero
+        HELD when nested. Nesting folds children into the parent and drops the
+        ones that are not open, which is exactly the order protection has to
+        find. The children still arrive on the parent's ``legs``, so leaving
+        ``nested`` off costs nothing.
         """
         from alpaca.trading.enums import QueryOrderStatus
 
         raw_orders = await self._client.get_orders(
-            status=QueryOrderStatus.ALL, limit=500, nested=nested, symbols=list(symbols) if symbols else None
+            status=QueryOrderStatus.ALL, limit=500, symbols=list(symbols) if symbols else None
         )
         return [
             to_order_state(o, self.active_environment)

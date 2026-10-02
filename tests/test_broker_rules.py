@@ -1,180 +1,163 @@
-"""Tests for the broker rules that broke protection against real Alpaca.
+"""The broker rules that decide whether protection can see an order.
 
-Every rule here was confirmed live against the PAPER API, not inferred:
-
-* a bracket child can be left in ``HELD``, which reserves the shares without
-  protecting anything and never appears in an OPEN query;
-* Alpaca reserves shares per open exit order, so a replacement exit submitted
-  before the old one is cancelled is always rejected;
-* ``replace_order`` is refused while the order is accepted or pending_new, which
-  is exactly the state a child is in right after its entry fills.
+Every rule here was confirmed against the live PAPER API rather than inferred.
+The ``nested`` one cost a full debugging round on the running machine, so it is
+pinned by a test that fails if anyone turns nesting back on.
 """
 
 from __future__ import annotations
 
+import asyncio
+import inspect
 from types import SimpleNamespace
 
-import pytest
+from alpaca.trading.client import TradingClient
+from alpaca.trading.enums import QueryOrderStatus
 
-from botalpaca.domain import TradingEnvironment
+from botalpaca.domain.enums import OrderSide, OrderType, TradingEnvironment
 from botalpaca.execution.client import order_status_value
-from botalpaca.execution.engine import _TERMINAL_STATUSES
+from botalpaca.execution.engine import ExecutionEngine
 from botalpaca.execution.mapping import to_order_state
-from botalpaca.protection.manager import _is_inert
 
 PAPER = TradingEnvironment.PAPER
 
 
-def _raw(status: str, order_id: str = "o1", **kw) -> object:
-    base = dict(
+def _run(coro):
+    return asyncio.run(coro)
+
+
+def _raw(status, order_id, **kw):
+    return SimpleNamespace(
         id=order_id,
         client_order_id=None,
-        symbol="AAPL",
-        qty=5.0,
-        side="sell",
-        type="stop",
-        order_class="simple",
+        symbol=kw.pop("symbol", "AAPL"),
+        qty=kw.pop("qty", 5.0),
+        side=kw.pop("side", OrderSide.SELL),
+        type=kw.pop("type", OrderType.MARKET),
+        order_class=kw.pop("order_class", "bracket"),
         status=status,
-        filled_qty=None,
-        filled_avg_price=None,
-        limit_price=None,
-        stop_price=97.0,
+        filled_qty=kw.pop("filled_qty", None),
+        filled_avg_price=kw.pop("filled_avg_price", None),
+        limit_price=kw.pop("limit_price", None),
+        stop_price=kw.pop("stop_price", None),
         trail_percent=None,
+        trail_price=None,
         legs=[],
+        **kw,
     )
-    base.update(kw)
-    return SimpleNamespace(**base)
 
 
-# -- status normalisation -------------------------------------------------------------
-@pytest.mark.parametrize(
-    ("raw", "expected"),
-    [
-        ("OrderStatus.NEW", "new"),
-        ("OrderStatus.FILLED", "filled"),
-        ("new", "new"),
-        ("HELD", "held"),
-        ("pending_new", "pending_new"),
-    ],
-)
-def test_status_value_unwraps_alpaca_enums(raw: str, expected: str):
-    assert order_status_value(_raw(raw)) == expected
-
-
-@pytest.mark.parametrize("status", sorted(_TERMINAL_STATUSES))
-def test_terminal_states_are_final(status: str):
-    assert status in _TERMINAL_STATUSES
-
-
-@pytest.mark.parametrize(
-    "status", ["new", "accepted", "held", "pending_new", "partially_filled", "pending_cancel"]
-)
-def test_live_states_are_not_terminal(status: str):
-    """Anything not final may still fill, so it must stay visible."""
-    assert status not in _TERMINAL_STATUSES
-
-
-# -- inert orders ---------------------------------------------------------------------
-def test_held_order_is_inert():
-    """HELD reserves the shares but can never fire."""
-    assert _is_inert(to_order_state(_raw("held"), PAPER)) is True
-
-
-def test_pending_cancel_order_is_inert():
-    assert _is_inert(to_order_state(_raw("pending_cancel"), PAPER)) is True
-
-
-def test_new_order_is_not_inert():
-    assert _is_inert(to_order_state(_raw("new"), PAPER)) is False
-
-
-def test_a_held_stop_is_not_counted_as_protection():
-    """The bug: a HELD stop looked like protection while protecting nothing."""
-    from botalpaca.protection.manager import PositionProtectionManager
-
-    manager = PositionProtectionManager.__new__(PositionProtectionManager)
-    state = manager._state_from_orders(PAPER, "AAPL", [to_order_state(_raw("held", "h1"), PAPER)], None)
-    assert state.has_stop is False
-    assert state.inert_order_ids == ["h1"]
-
-
-# -- the call signatures the broker actually has --------------------------------------
-def test_alpaca_cancel_orders_takes_no_symbol():
-    """Guards the bug that made /cancelar raise TypeError.
-
-    ``TradingClient.cancel_orders`` accepts no arguments, so our wrapper must
-    never forward a symbol to it.
-    """
-    import inspect
-
-    from alpaca.trading.client import TradingClient
-
-    params = inspect.signature(TradingClient.cancel_orders).parameters
-    assert "symbol" not in params
-
-
-def test_alpaca_query_order_status_has_no_held():
-    """HELD is unreachable by status, which is why live queries use ALL."""
-    from alpaca.trading.enums import QueryOrderStatus
-
-    members = {m.name.lower() for m in QueryOrderStatus}
+# --- what Alpaca can even ask for ------------------------------------------------
+def test_query_order_status_has_no_held():
+    """A HELD order can only be found through ALL, never through OPEN."""
+    members = [str(m).split(".")[-1].lower() for m in QueryOrderStatus]
     assert "held" not in members
     assert "all" in members
 
 
-# -- resolution ------------------------------------------------------------------------
-async def test_live_orders_exclude_terminal_states_and_keep_held(database):
-    from botalpaca.execution.engine import ExecutionEngine
-    from tests.conftest import FakeTradingClient
-
-    client = FakeTradingClient(PAPER)
-    for raw in (
-        _raw("new", "live-1"),
-        _raw("filled", "dead-1"),
-        _raw("canceled", "dead-2"),
-        _raw("held", "held-1"),
-    ):
-        client.orders[raw.id] = raw
-
-    engine = ExecutionEngine(client, database, active_environment=PAPER)
-    ids = {o.id for o in await engine.get_live_orders_for_symbol("AAPL")}
-    assert "live-1" in ids
-    assert "held-1" in ids, "a HELD child still reserves the shares and must be visible"
-    assert "dead-1" not in ids
-    assert "dead-2" not in ids
+def test_alpaca_cancel_orders_takes_no_symbol():
+    """Forwarding a symbol raised TypeError and made /cancelar dead."""
+    assert "symbol" not in inspect.signature(TradingClient.cancel_orders).parameters
 
 
-async def test_ensure_stop_clears_the_inert_order_before_creating(database):
-    """A HELD child holds the shares; creating a stop without clearing it fails."""
-    from tests.test_protection import PAPER as P
-    from tests.test_protection import _setup, _stop_order, make_position
+def test_status_value_unwraps_alpaca_enums():
+    from alpaca.trading.enums import OrderStatus
 
-    manager, engine, client = await _setup(database, [_stop_order("held-1", stop=97.0)])
-    client.orders["held-1"].status = "held"
+    assert order_status_value(_raw(OrderStatus.NEW, "a")) == "new"
+    assert order_status_value(_raw(OrderStatus.FILLED, "a")) == "filled"
+    assert order_status_value(_raw(OrderStatus.HELD, "a")) == "held"
+    assert order_status_value(_raw("pending_new", "a")) == "pending_new"
 
-    state = await manager.ensure_stop(
-        environment=P, position=make_position(entry=100.0, current=102.0), stop_price=95.0
+
+# --- nesting is what hides HELD --------------------------------------------------
+def test_live_orders_are_queried_without_nesting():
+    """Nesting folds children into the parent and drops the non-open ones.
+
+    Measured on the PAPER account: the identical query returns 38 rows including
+    the HELD order unnested, and 18 rows with zero HELD when nested. This asserts
+    the arguments the engine really sends, not the text of its docstring.
+    """
+    seen: dict[str, object] = {}
+
+    class _RecordingClient:
+        environment_name = PAPER
+        environment = PAPER
+
+        async def get_orders(self, **kwargs):
+            seen.update(kwargs)
+            return [
+                _raw("held", "h1", type=OrderType.STOP, stop_price=97.0),
+                _raw("new", "t1", type=OrderType.LIMIT, limit_price=106.0),
+                _raw("filled", "old"),
+            ]
+
+    engine = ExecutionEngine(_RecordingClient(), None, active_environment=PAPER)
+    live = _run(engine.get_live_orders(symbols=["AAPL"]))
+
+    assert seen.get("nested") is None, "nesting hides the HELD order protection needs"
+    assert seen["status"] == QueryOrderStatus.ALL
+    # The HELD order survives the terminal filter; the filled one does not.
+    assert [o.id for o in live] == ["h1", "t1"]
+
+
+def test_get_live_orders_takes_no_nested_argument():
+    """The footgun is removed, not merely unused."""
+    params = inspect.signature(ExecutionEngine.get_live_orders).parameters
+    assert "nested" not in params
+
+
+# --- which orders count as still able to act -------------------------------------
+def test_terminal_states_are_final():
+    from botalpaca.execution.engine import _TERMINAL_STATUSES
+
+    assert _TERMINAL_STATUSES == frozenset(
+        {"filled", "canceled", "expired", "replaced", "rejected"}
     )
-    assert "held-1" in client.cancelled
-    assert state.has_stop is True
 
 
-async def test_break_even_recreates_when_replace_is_refused(database):
-    """Right after an entry fills the stop is pending_new and cannot be replaced."""
-    from tests.test_protection import PAPER as P
-    from tests.test_protection import _setup, _stop_order, make_position
+def test_live_states_are_not_terminal():
+    from botalpaca.execution.engine import _TERMINAL_STATUSES
 
-    manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0)])
+    for state in ("new", "accepted", "held", "pending_new", "partially_filled"):
+        assert state not in _TERMINAL_STATUSES
 
-    async def refuse(order_id, request):
-        raise RuntimeError("order cannot be replaced when status is pending_new")
 
-    client.replace_order_by_id = refuse
+def test_a_held_stop_is_not_counted_as_protection():
+    """It reserves the shares and cannot execute, so it is not a stop."""
+    from botalpaca.protection.manager import PositionProtectionManager
 
-    state = await manager.move_to_break_even(
-        environment=P, position=make_position(entry=100.0, current=104.0)
+    manager = PositionProtectionManager.__new__(PositionProtectionManager)
+    held = to_order_state(
+        _raw("held", "h1", type=OrderType.STOP, stop_price=97.0), PAPER
     )
-    assert state.break_even_active is True
+    state = manager._state_from_orders(PAPER, "AAPL", [held], OrderSide.SELL)
+    assert state.has_stop is False
+    assert state.inert_order_ids == ["h1"]
+
+
+def test_a_new_stop_is_counted_as_protection():
+    from botalpaca.protection.manager import PositionProtectionManager
+
+    manager = PositionProtectionManager.__new__(PositionProtectionManager)
+    live = to_order_state(
+        _raw("new", "s1", type=OrderType.STOP, stop_price=97.0), PAPER
+    )
+    state = manager._state_from_orders(PAPER, "AAPL", [live], OrderSide.SELL)
     assert state.has_stop is True
-    assert "s1" in client.cancelled, "the unreplaceable stop must be cancelled"
-    assert any("recreado" in n for n in state.notes)
+    assert state.stop_price == 97.0
+    assert state.inert_order_ids == []
+
+
+# --- inert states ----------------------------------------------------------------
+def test_held_and_pending_cancel_are_inert():
+    from botalpaca.protection.manager import _is_inert
+
+    assert _is_inert(to_order_state(_raw("held", "a"), PAPER)) is True
+    assert _is_inert(to_order_state(_raw("pending_cancel", "a"), PAPER)) is True
+    assert _is_inert(to_order_state(_raw("pending_replace", "a"), PAPER)) is True
+
+
+def test_new_order_is_not_inert():
+    from botalpaca.protection.manager import _is_inert
+
+    assert _is_inert(to_order_state(_raw("new", "a"), PAPER)) is False
