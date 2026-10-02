@@ -1043,6 +1043,13 @@ class PositionProtectionManager:
                     )
                 else:
                     notes.append(f"🧹 {symbol}: ordenes inertes liberadas")
+            # A trailing stop is the exit for this position, so it counts as
+            # protection. Asking for a fixed stop on top of it fails anyway --
+            # Alpaca reserves the shares for the trailing order and rejects the
+            # second exit for insufficient qty available, which reads as a
+            # failure to protect a position that is already protected.
+            if state.has_trailing:
+                continue
             if not state.has_stop:
                 if not auto:
                     notes.append(f"⚠️ {symbol}: posición abierta SIN stop en Alpaca")

@@ -14,6 +14,7 @@ from __future__ import annotations
 import pytest
 
 from botalpaca.execution.mapping import to_order_state
+from tests.conftest import fake_order_raw
 from tests.test_protection import PAPER, _setup, _stop_order, make_position
 
 
@@ -90,6 +91,38 @@ async def test_nothing_inert_means_no_cancel_chatter(database):
     await protection.ensure_stop(environment=PAPER, position=position)
 
     assert client.cancelled == []
+
+
+async def test_reconcile_leaves_a_trailing_stop_alone(database):
+    """A trailing stop IS the protection.
+
+    Adding a fixed stop on top of it is rejected for insufficient qty, because
+    Alpaca reserves the shares for the trailing order. That used to surface as
+    a failure to protect a position that was already protected.
+    """
+    manager, engine, client = await _setup(database)
+    protection = manager
+    position = make_position(entry=100.0, current=110.0)
+
+    trail = fake_order_raw(
+        "t1",
+        order_type="trailing_stop",
+        side="sell",
+        status="new",
+        qty=10.0,
+    )
+    trail.trail_percent = 2.0
+    client.orders["t1"] = trail
+
+    state = await protection.state_for_position(PAPER, position)
+    assert state.has_trailing is True
+    assert state.has_stop is False
+
+    before = list(client.submitted)
+    notes = await protection.reconcile(environment=PAPER, positions=[position])
+
+    assert client.submitted == before, "no exit may be added above a trailing stop"
+    assert not any("stop" in note.lower() for note in notes), notes
 
 
 @pytest.mark.parametrize("status", ["pending_cancel", "pending_replace"])
