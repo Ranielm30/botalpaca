@@ -239,17 +239,21 @@ async def test_close_position_closes_everything_by_default(database):
 async def test_close_position_accepts_partial_qty(database):
     engine, client = await _engine(database)
     await engine.close_position("AAPL", environment=TradingEnvironment.PAPER, qty="1")
-    request = client.closed_calls[0]["request"]
-    assert request.qty == "1"
-    assert request.percentage is None
+    call = client.closed_calls[0]
+    assert call["qty"] == "1"
+    assert call["percentage"] is None
 
 
 async def test_close_position_all_when_nothing_given(database):
+    # The client builds the ClosePositionRequest itself, so the engine only
+    # forwards qty/percentage. The whole position is "100" -- Alpaca rejects
+    # the string "all" with "percentage must be between 0 and 100" and leaves
+    # the position open, which is how MSFT survived its time stop.
     engine, client = await _engine(database)
     await engine.close_position("AAPL", environment=TradingEnvironment.PAPER)
-    request = client.closed_calls[0]["request"]
-    assert request.percentage == "all"
-    assert request.qty is None
+    call = client.closed_calls[0]
+    assert call["percentage"] == "100"
+    assert call["qty"] is None
 
 
 async def test_get_open_orders_exposes_nested_legs(database):

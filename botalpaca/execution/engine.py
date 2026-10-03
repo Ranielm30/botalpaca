@@ -358,8 +358,10 @@ class ExecutionEngine:
             raise ConfirmationRequiredError("Closing a position requires confirmation.")
         if qty is None and percentage is None:
             # Alpaca rejects a ClosePositionRequest with neither qty nor
-            # percentage; "all" is its documented whole-position form.
-            percentage = "all"
+            # percentage. The whole position is 100%, not the string "all" --
+            # the API answers "percentage must be between 0 and 100" and the
+            # position stays open.
+            percentage = "100"
         # The client builds the ClosePositionRequest itself; passing one in used
         # to raise TypeError and left the position open.
         try:

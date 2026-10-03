@@ -17,7 +17,6 @@ from botalpaca.domain import SignalDirection
 from botalpaca.domain.models import StructureLevel, StructureState
 from botalpaca.strategies.base import (
     MAX_STRUCTURE_STOP_BUDGET,
-    TradeLevels,
     levels_from_atr,
     refine_levels_with_structure,
 )
@@ -171,8 +170,6 @@ def test_the_engine_and_the_client_agree_on_close_position():
     """
     import inspect
 
-    from alpaca.trading.client import TradingClient
-
     from botalpaca.execution.client import AlpacaTradingClient
     from botalpaca.execution.engine import ExecutionEngine
 
@@ -227,5 +224,20 @@ async def test_closing_a_position_reaches_the_client(database):
     result = await engine.close_position(
         "aapl", environment=TradingEnvironment.PAPER, confirmed=True
     )
-    assert seen == {"symbol": "AAPL", "qty": None, "percentage": "all"}
+    assert seen == {"symbol": "AAPL", "qty": None, "percentage": "100"}
     assert result.order is not None
+
+
+def test_a_whole_position_close_sends_a_percentage_alpaca_accepts():
+    """"all" is rejected with 'percentage must be between 0 and 100'.
+
+    The position then stays open and the time stop looks configured while doing
+    nothing, which is exactly what happened to MSFT.
+    """
+    import inspect
+
+    from botalpaca.execution.engine import ExecutionEngine
+
+    source = inspect.getsource(ExecutionEngine.close_position)
+    assert 'percentage = "100"' in source
+    assert 'percentage = "all"' not in source
