@@ -16,6 +16,7 @@ broker call so a crash mid-flight cannot produce a duplicate on retry.
 
 from __future__ import annotations
 
+import asyncio
 import datetime as dt
 import uuid
 from collections.abc import Sequence
@@ -24,6 +25,7 @@ from typing import Any
 from botalpaca.config import get_logger
 from botalpaca.db import Database, OrderAuditModel, OrderAuditRepository
 from botalpaca.domain import (
+    BotalpacaError,
     ConfirmationRequiredError,
     DuplicateOrderError,
     EnvironmentMismatchError,
@@ -313,6 +315,21 @@ class ExecutionEngine:
         logger.info("execution.cancelled", environment=environment.value, order_id=order_id)
         return True
 
+    async def _await_exits_released(
+        self, symbol: str, *, attempts: int = 20, delay: float = 0.5
+    ) -> bool:
+        """Wait until no open exit still reserves the shares for ``symbol``."""
+        for attempt in range(max(attempts, 1)):
+            try:
+                orders = await self.get_live_orders_for_symbol(symbol)
+            except (BotalpacaError, BrokerError, RuntimeError) as exc:
+                logger.warning("execution.exit_probe_failed", symbol=symbol, error=str(exc))
+            else:
+                if not orders:
+                    return True
+            await asyncio.sleep(min(delay * (1.5**attempt), 2.5))
+        return False
+
     async def cancel_orders_for_symbol(
         self, symbol: str, *, environment: TradingEnvironment
     ) -> bool:
@@ -369,7 +386,12 @@ class ExecutionEngine:
         # available ... held_for_orders". Release the exits first, then close --
         # otherwise every timed close fails and the position stays open with the
         # very protection meant to end it.
-        await self.cancel_orders_for_symbol(symbol.upper(), environment=environment)
+        target = symbol.upper()
+        await self.cancel_orders_for_symbol(target, environment=environment)
+        # Cancelling does not release the shares straight away. Closing in the
+        # same breath is rejected for insufficient qty, so wait for the exits to
+        # actually go terminal before selling.
+        await self._await_exits_released(target)
 
         # The client builds the ClosePositionRequest itself; passing one in used
         # to raise TypeError and left the position open.

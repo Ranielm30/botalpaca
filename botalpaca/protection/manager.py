@@ -326,6 +326,12 @@ class PositionProtectionManager:
                 await self._engine.cancel_order(order_id, environment=environment)
                 cleared.append(order_id)
             except Exception as exc:  # noqa: BLE001 - report it, never hide it
+                # "order pending cancel" means Alpaca already accepted this
+                # cancel and is working on it. Reporting it as a failure every
+                # cycle is noise that hides the failures that matter.
+                if "pending cancel" in str(exc).lower():
+                    cleared.append(order_id)
+                    continue
                 stuck.append(order_id)
                 log.warning(
                     "protection.inert_cancel_failed",
