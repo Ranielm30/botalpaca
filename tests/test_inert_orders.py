@@ -64,7 +64,7 @@ async def test_reconcile_sweeps_inert_orders_on_a_protected_position(database):
     notes = await protection.reconcile(environment=PAPER, positions=[position])
 
     assert "stale-2" in client.cancelled
-    assert any("inertes" in note for note in notes), notes
+    assert any("ancladas" in note for note in notes), notes
 
 
 async def test_a_held_order_is_never_counted_as_protection(database):

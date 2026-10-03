@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import pytest
 
+from botalpaca.app import Application
 from botalpaca.domain.enums import TradingEnvironment
 from tests.test_protection import PAPER, _setup, _stop_order, make_position
 
@@ -99,7 +100,7 @@ async def test_reconcile_says_so_when_inert_orders_stay_stuck(database):
 
     notes = await protection.reconcile(environment=PAPER, positions=[position])
 
-    assert any("🚨" in n and "inerte" in n for n in notes), notes
+    assert any("🚨" in n and "ancladas" in n for n in notes), notes
 
 
 def _to_state(raw):
@@ -119,6 +120,7 @@ class _Notifications:
 
 
 class _App:
+    _reconcile_state = None
     def __init__(self) -> None:
         self.notifications = _Notifications()
         self.active_environment = TradingEnvironment.PAPER
@@ -177,4 +179,96 @@ async def test_both_levels_of_problem_are_actionable(note):
 
     app = _App()
     await Application._notify_reconciliation(app, TradingEnvironment.PAPER, [note])
-    assert note in app.notifications.sent[0][0]
+    text = app.notifications.sent[0][0]
+    # The card puts the symbol on its own line and the reason under it.
+    symbol, _, reason = note.partition(": ")
+    assert symbol in text
+    assert reason in text
+
+
+async def test_the_notice_never_shows_raw_broker_json():
+    """The operator reads a sentence, not an Alpaca payload."""
+    from botalpaca.protection.manager import readable_reason
+
+    raw = (
+        'Alpaca rejected the request: {"available":"0","code":40310000,'
+        '"existing_qty":"4","held_for_orders":4,"message":"insufficient qty '
+        'available for order (requested: 4, available: 0)","symbol":"MSFT"}'
+    )
+    reason = readable_reason(raw)
+    assert "insufficient qty available" not in reason
+    assert "{" not in reason and "held_for_orders" not in reason
+    assert "mercado abra" in reason
+
+
+def test_an_unknown_broker_error_is_still_readable():
+    from botalpaca.protection.manager import readable_reason
+
+    reason = readable_reason("something nobody predicted")
+    assert "{" not in reason
+    assert len(reason) <= 140
+
+
+async def test_the_same_problem_is_announced_once():
+    class _Notifications:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send(self, text, keyboard=None, *, force=False):
+            self.sent.append(text)
+            return True
+
+    class _App:
+        _reconcile_state = None
+
+    app = _App()
+    app.notifications = _Notifications()
+    notify = Application._notify_reconciliation
+    notes = ["\U0001F6A8 MSFT: ancladas en Alpaca retienen las acciones"]
+
+    await notify(app, PAPER, notes)
+    await notify(app, PAPER, notes)
+    await notify(app, PAPER, notes)
+    assert len(app.notifications.sent) == 1, "the same problem must not repeat"
+
+
+async def test_a_changed_problem_is_announced_again():
+    class _Notifications:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send(self, text, keyboard=None, *, force=False):
+            self.sent.append(text)
+            return True
+
+    class _App:
+        _reconcile_state = None
+
+    app = _App()
+    app.notifications = _Notifications()
+    notify = Application._notify_reconciliation
+
+    await notify(app, PAPER, ["\U0001F6A8 MSFT: ancladas en Alpaca"])
+    await notify(app, PAPER, ["\U0001F6A8 NVDA: ancladas en Alpaca"])
+    assert len(app.notifications.sent) == 2
+
+
+async def test_the_notice_explains_what_happens_next():
+    class _Notifications:
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        async def send(self, text, keyboard=None, *, force=False):
+            self.sent.append(text)
+            return True
+
+    class _App:
+        _reconcile_state = None
+
+    app = _App()
+    app.notifications = _Notifications()
+    await Application._notify_reconciliation(app, PAPER, ["\u274C MSFT: SIN stop"])
+    text = app.notifications.sent[0]
+    assert "MSFT" in text
+    assert "SIN stop" in text
+    assert "mercado abra" in text

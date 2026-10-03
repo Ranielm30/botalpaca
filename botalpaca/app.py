@@ -352,6 +352,9 @@ class Application:
         self.learning = StatisticalEngine(self.database)
 
         self._sender = sender or _no_sender
+        # Fingerprint of the last reconciliation report actually sent, so an
+        # unresolved problem is announced once instead of every cycle.
+        self._reconcile_state: str | None = None
         self._alert_handler: AlertHandler | None = None
         self.contexts: dict[TradingEnvironment, EnvironmentContext] = {}
         self.active: EnvironmentContext
@@ -651,16 +654,37 @@ class Application:
         protected is the single most important thing this process knows and the
         one thing the operator cannot see -- silence on a stuck position reads
         exactly like "everything is fine".
+
+        The same unresolved problem is re-discovered every cycle, so identical
+        reports are only sent when they change. A repeat that clears is worth
+        saying, because silence on a recovery looks like a stale warning.
         """
         actionable = [n for n in notes if "🚨" in n or "❌" in n]
         if not actionable:
+            self._reconcile_state = None
             return
+
+        lines = []
+        for note in actionable:
+            # One sentence per position: the note is written for a log reader.
+            symbol, _, reason = note.partition(": ")
+            lines.append(f"{symbol}\n   {reason}")
+
+        fingerprint = "\n".join(sorted(actionable))
+        previous = self._reconcile_state
+        self._reconcile_state = fingerprint
+        if fingerprint == previous:
+            return
+
         text = "\n".join(
             [
                 "<b>Aviso de proteccion</b>",
                 f"Entorno: {environment.value}",
                 "",
-                *actionable,
+                *lines,
+                "",
+                "📈 Alpaca retiene las acciones de esas ordenes hasta "
+                "que el mercado abra. El bot lo reintenta solo.",
             ]
         )
         try:

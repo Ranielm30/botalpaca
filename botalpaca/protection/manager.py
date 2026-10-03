@@ -66,6 +66,42 @@ def _is_inert(order: OrderState) -> bool:
     return status in _INERT_STATUSES
 
 
+
+# Alpaca answers in raw broker JSON. Dumping that into an operator's chat is
+# unreadable and leaks internals that mean nothing outside the log, so each
+# known rejection gets a sentence. The raw error still goes to the log.
+_REASONS: tuple[tuple[str, str], ...] = (
+    (
+        "insufficient qty available",
+        "Alpaca tiene reservadas las acciones para otra orden viva. "
+        "Se liberaran cuando el mercado abra.",
+    ),
+    (
+        "order pending cancel",
+        "hay una cancelacion pendiente en Alpaca desde antes",
+    ),
+    (
+        "percentage must be between",
+        "el valor de cierre enviado no es valido",
+    ),
+    (
+        "not enough buying power",
+        "no hay poder de compra suficiente para esa orden",
+    ),
+)
+
+
+def readable_reason(error: object) -> str:
+    """Turn a broker rejection into one sentence a human can act on."""
+    text = str(error).lower()
+    for needle, reason in _REASONS:
+        if needle in text:
+            return reason
+    # Anything unknown: keep the first line only, never a JSON blob.
+    first = str(error).strip().splitlines()[0] if str(error).strip() else "error desconocido"
+    return first[:140]
+
+
 class PositionProtectionManager:
     """Owns the lifecycle of every protective order in ONE environment."""
 
@@ -1061,8 +1097,8 @@ class PositionProtectionManager:
                 blocked = await self._clear_inert_orders(environment, position, state)
                 if blocked:
                     notes.append(
-                        f"🚨 {symbol}: {len(blocked)} orden(es) inertes retienen las "
-                        "acciones y no se pudieron cancelar"
+                        f"🚨 {symbol}: {len(blocked)} orden(es) ancladas en Alpaca "
+                        "retienen las acciones y no se pueden cancelar todavia"
                     )
                 else:
                     notes.append(f"🧹 {symbol}: ordenes inertes liberadas")
@@ -1086,7 +1122,9 @@ class PositionProtectionManager:
                     )
                     notes.append(f"🛡️ {symbol}: stop de emergencia creado")
                 except Exception as exc:  # noqa: BLE001 - reconciliation must not abort
-                    notes.append(f"❌ {symbol}: no se pudo crear stop automático ({exc})")
+                    notes.append(
+                        f"❌ {symbol}: SIN stop — {readable_reason(exc)}"
+                    )
                     log.error("protection.reconcile.failed", symbol=symbol, error=str(exc))
             if symbol not in stored:
                 notes.append(f"ℹ️ {symbol}: adoptada en SQLite (posición huérfana de Alpaca)")
