@@ -362,6 +362,15 @@ class ExecutionEngine:
             # the API answers "percentage must be between 0 and 100" and the
             # position stays open.
             percentage = "100"
+
+        # Alpaca reserves the shares for every open exit order. A protected
+        # position therefore cannot be closed: the protective stop holds exactly
+        # the quantity being sold and the close comes back "insufficient qty
+        # available ... held_for_orders". Release the exits first, then close --
+        # otherwise every timed close fails and the position stays open with the
+        # very protection meant to end it.
+        await self.cancel_orders_for_symbol(symbol.upper(), environment=environment)
+
         # The client builds the ClosePositionRequest itself; passing one in used
         # to raise TypeError and left the position open.
         try:

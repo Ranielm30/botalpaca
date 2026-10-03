@@ -202,14 +202,13 @@ def test_the_client_matches_the_real_sdk_close_position_signature():
 async def test_closing_a_position_reaches_the_client(database):
     """End to end: the engine must forward qty/percentage, not a request object."""
     from botalpaca.domain.enums import TradingEnvironment
-    from tests.conftest import FakeTradingClient
+    from tests.conftest import FakeTradingClient, fake_order_raw
 
     client = FakeTradingClient(TradingEnvironment.PAPER)
     seen: dict = {}
 
     async def close_position(symbol, *, qty=None, percentage=None):
         seen.update(symbol=symbol, qty=qty, percentage=percentage)
-        from tests.conftest import fake_order_raw
 
         return fake_order_raw("close-1", symbol=symbol, side="sell", status="accepted")
 
@@ -241,3 +240,46 @@ def test_a_whole_position_close_sends_a_percentage_alpaca_accepts():
     source = inspect.getsource(ExecutionEngine.close_position)
     assert 'percentage = "100"' in source
     assert 'percentage = "all"' not in source
+
+
+
+
+async def test_closing_a_protected_position_releases_the_exits_first(database):
+    """A protective stop reserves the shares it is meant to protect.
+
+    Closing a protected position without cancelling first comes back
+    ``insufficient qty available ... held_for_orders``, so every timed close
+    fails and the position stays open under the very protection meant to end it.
+    """
+    from botalpaca.domain.enums import TradingEnvironment
+    from botalpaca.execution.engine import ExecutionEngine
+    from tests.conftest import FakeTradingClient, fake_order_raw
+
+    client = FakeTradingClient(TradingEnvironment.PAPER)
+    client.orders["s1"] = fake_order_raw(
+        "s1", order_type="stop", side="sell", status="new", stop_price=99.0
+    )
+    engine = ExecutionEngine(
+        client,
+        database,
+        active_environment=TradingEnvironment.PAPER,
+        require_confirmation=False,
+    )
+
+    seen: list[tuple] = []
+
+    async def fake_close(symbol, *, qty=None, percentage=None):
+        seen.append((symbol, qty, percentage))
+        return fake_order_raw("close-1", order_type="market", side="sell", status="accepted")
+
+    client.close_position = fake_close
+
+    async def fake_cancel(order_id):
+        client.cancelled.append(order_id)
+
+    client.cancel_order_by_id = fake_cancel
+
+    await engine.close_position("aapl", environment=TradingEnvironment.PAPER)
+
+    assert "s1" in client.cancelled, "the protective stop must be released first"
+    assert seen == [("AAPL", None, "100")], seen
