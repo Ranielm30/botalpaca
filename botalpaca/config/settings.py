@@ -177,7 +177,11 @@ class MonitoringSettings(BaseSettings):
     auto_trading_enabled: bool = False  # signals never auto-execute by default
     position_alert_cooldown_seconds: int = Field(default=900, ge=0)
     signal_alert_cooldown_seconds: int = Field(default=1800, ge=0)
-    opportunity_alert_min_score: float = Field(default=75.0, ge=0, le=100)
+    # This gate runs AFTER the scanner, so setting it above the confluence
+    # execution floor silently discards every opportunity the scanner just
+    # called tradable -- the scan reports them and nothing is ever delivered.
+    # It must not be looser than confluence.engine.MIN_EXECUTABLE_SCORE.
+    opportunity_alert_min_score: float = Field(default=60.0, ge=0, le=100)
     max_alerts_per_hour: int = Field(default=20, gt=0)
     score_drop_alert_threshold: float = Field(default=20.0, gt=0)
     momentum_score_threshold: float = Field(default=50.0, ge=0, le=100)
@@ -388,3 +392,4 @@ __all__ = [
     "get_settings",
     "reset_settings",
 ]
+

@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 
 from botalpaca.config import MonitoringSettings, ProtectionSettings, get_settings
 from botalpaca.config.logging import get_logger
+from botalpaca.confluence.engine import MIN_EXECUTABLE_SCORE
 from botalpaca.db import AppStateRepository, Database, TradeRepository
 from botalpaca.domain import (
     ExitReason,
@@ -98,6 +99,21 @@ class MarketMonitor:
         self._last_alert: dict[str, dt.datetime] = {}
         self._running = False
 
+        # An alert floor above the confluence floor discards, in silence, every
+        # opportunity the scanner just called tradable. That is how a scan
+        # reporting ten tradable setups delivered nothing at all for hours, so
+        # it is stated out loud at boot rather than discovered by waiting.
+        if self.settings.opportunity_alert_min_score > MIN_EXECUTABLE_SCORE:
+            log.warning(
+                "market_monitor.alert_floor_above_execution_floor",
+                alert_floor=self.settings.opportunity_alert_min_score,
+                execution_floor=MIN_EXECUTABLE_SCORE,
+                note=(
+                    "oportunidades ejecutables por debajo de "
+                    f"{self.settings.opportunity_alert_min_score:.0f} no se avisaran"
+                ),
+            )
+
     @property
     def running(self) -> bool:
         return self._running
@@ -136,9 +152,17 @@ class MarketMonitor:
     async def _maybe_alert(self, opportunity: Opportunity) -> None:
         if self._notify is None:
             return
-        if opportunity.score < self.settings.opportunity_alert_min_score:
-            return
         if not opportunity.tradable:
+            return
+        if opportunity.score < self.settings.opportunity_alert_min_score:
+            # Only reachable when the operator deliberately raised this above the
+            # confluence floor. __init__ warns at boot, so it is never a surprise.
+            log.debug(
+                "market_monitor.below_alert_floor",
+                symbol=opportunity.symbol,
+                score=opportunity.score,
+                floor=self.settings.opportunity_alert_min_score,
+            )
             return
         if self.settings.auto_trading_enabled:
             # Automatic execution is a deliberate, opt-in decision. Even when on,
