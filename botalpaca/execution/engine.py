@@ -356,15 +356,16 @@ class ExecutionEngine:
         self._assert_environment(environment)
         if self.require_confirmation and not confirmed:
             raise ConfirmationRequiredError("Closing a position requires confirmation.")
-        from alpaca.trading.requests import ClosePositionRequest
-
         if qty is None and percentage is None:
             # Alpaca rejects a ClosePositionRequest with neither qty nor
             # percentage; "all" is its documented whole-position form.
             percentage = "all"
-        request = ClosePositionRequest(qty=qty, percentage=percentage)
+        # The client builds the ClosePositionRequest itself; passing one in used
+        # to raise TypeError and left the position open.
         try:
-            raw_order = await self._client.close_position(symbol.upper(), request=request)
+            raw_order = await self._client.close_position(
+                symbol.upper(), qty=qty, percentage=percentage
+            )
         except BrokerError as exc:
             await self._record_failure(None, environment, str(exc), symbol=symbol)
             raise OrderRejectedByBrokerError(str(exc)) from exc

@@ -160,3 +160,72 @@ def test_strategy_settings_are_unaffected_by_the_refinement():
     """No strategy knob was moved: this only relocates the levels."""
     assert StrategySettings().atr_stop_multiplier == 2.0
     assert StrategySettings().atr_target_multiplier == 3.0
+
+
+# -- close_position signature compatibility ------------------------------------------
+def test_the_engine_and_the_client_agree_on_close_position():
+    """The engine used to pass a ClosePositionRequest the client never accepted.
+
+    It surfaced as TypeError on every time stop and every autonomous close, so
+    the position simply stayed open while the log filled with errors.
+    """
+    import inspect
+
+    from alpaca.trading.client import TradingClient
+
+    from botalpaca.execution.client import AlpacaTradingClient
+    from botalpaca.execution.engine import ExecutionEngine
+
+    engine_params = set(inspect.signature(ExecutionEngine.close_position).parameters)
+    client_params = set(inspect.signature(AlpacaTradingClient.close_position).parameters)
+    forwarded = {"symbol", "qty", "percentage", "environment"}
+
+    assert client_params >= {"qty", "percentage"}, client_params
+    assert engine_params >= forwarded, engine_params
+    assert "request" not in client_params, (
+        "the client builds its own ClosePositionRequest; the engine must not pass one"
+    )
+
+
+def test_the_client_matches_the_real_sdk_close_position_signature():
+    """Pinned against the SDK, so an upgrade cannot silently break the close."""
+    import inspect
+
+    from alpaca.trading.client import TradingClient
+
+    from botalpaca.execution.client import AlpacaTradingClient
+
+    sdk = set(inspect.signature(TradingClient.close_position).parameters)
+    ours = set(inspect.signature(AlpacaTradingClient.close_position).parameters)
+    assert {"symbol_or_asset_id"} <= sdk
+    assert not ({"request"} & ours), "no request kwarg in our signature"
+    assert {"symbol", "qty", "percentage"} <= ours
+
+
+async def test_closing_a_position_reaches_the_client(database):
+    """End to end: the engine must forward qty/percentage, not a request object."""
+    from botalpaca.domain.enums import TradingEnvironment
+    from tests.conftest import FakeTradingClient
+
+    client = FakeTradingClient(TradingEnvironment.PAPER)
+    seen: dict = {}
+
+    async def close_position(symbol, *, qty=None, percentage=None):
+        seen.update(symbol=symbol, qty=qty, percentage=percentage)
+        from tests.conftest import fake_order_raw
+
+        return fake_order_raw("close-1", symbol=symbol, side="sell", status="accepted")
+
+    client.close_position = close_position  # type: ignore[method-assign]
+
+    from botalpaca.execution.engine import ExecutionEngine
+
+    engine = ExecutionEngine(
+        client, database, active_environment=TradingEnvironment.PAPER,
+        require_confirmation=False,
+    )
+    result = await engine.close_position(
+        "aapl", environment=TradingEnvironment.PAPER, confirmed=True
+    )
+    assert seen == {"symbol": "AAPL", "qty": None, "percentage": "all"}
+    assert result.order is not None
