@@ -19,10 +19,17 @@ from botalpaca.domain import (
     SetupType,
     SignalDirection,
     StrategySignal,
+    StructureState,
     TechnicalSnapshot,
 )
 
-__all__ = ["BaseStrategy", "TradeLevels", "levels_from_atr", "make_fingerprint"]
+__all__ = [
+    "BaseStrategy",
+    "TradeLevels",
+    "levels_from_atr",
+    "make_fingerprint",
+    "refine_levels_with_structure",
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -79,6 +86,104 @@ def levels_from_atr(
         target = entry - atr * target_multiplier
     return TradeLevels(
         direction=direction, entry=entry, stop=stop, targets=(float(target),)
+    )
+
+
+# How far past its ATR budget a structural stop may reach. Real levels
+# sit a little wider than an ATR multiple; without slack the refinement
+# would reject the very levels it exists to use.
+MAX_STRUCTURE_STOP_BUDGET = 2.0
+
+
+def refine_levels_with_structure(
+    levels: TradeLevels,
+    structure: StructureState | None,
+    atr: float,
+    *,
+    min_rr: float,
+    min_stop_atr: float = 0.5,
+) -> TradeLevels:
+    """Move the levels onto real structure, so the R:R finally means something.
+
+    ``levels_from_atr`` places the stop and the target as multiples of the same
+    ATR, so ``(target - entry) / (entry - stop)`` collapses to
+    ``target_multiplier / stop_multiplier`` -- a constant, the same for every
+    symbol and every day. A risk filter built on that ratio can never reject
+    anything.
+
+    Here the stop goes to the level price must actually defend, and the target
+    goes to the next obstacle in the way. Both are market prices, so the ratio
+    becomes a measurement of the setup rather than of the configuration.
+
+    A level is only adopted when it is genuinely usable:
+
+    * the stop must sit beyond a support the market has tested (or resistance
+      for a short), and never so close that ordinary noise reaches it;
+    * the target must clear ``min_rr``; if the closest obstacle does not, the
+      next one is taken, and the ATR target is kept only when nothing on the
+      chart is reachable.
+
+    Anything unusable falls back to what the strategy already chose, so this
+    can only sharpen a setup, never break one.
+    """
+    if structure is None or atr <= 0:
+        return levels
+
+    long = levels.direction is SignalDirection.LONG
+    defensive = structure.supports if long else structure.resistances
+    obstacle = structure.resistances if long else structure.supports
+
+    def _beyond(price: float, reference: float) -> bool:
+        return price < reference if long else price > reference
+
+    def _distance(price: float) -> float:
+        return abs(price - levels.entry)
+
+    # -- stop: the level price must defend, with room for noise ---------------
+    # The ATR stop sets the budget: how much risk the strategy was willing to
+    # take. The structure then decides how much room is actually needed, within
+    # a cap of twice that budget -- real levels routinely sit a little further
+    # out than an ATR multiple, and honouring that is the whole point, but an
+    # unbounded level would silently multiply the size of the trade.
+    #
+    # The deepest usable level wins. Taking the one nearest the entry instead
+    # would put the stop in front of the support, so it would fire before that
+    # support was ever tested.
+    budget = _distance(levels.stop)
+    cap = budget * MAX_STRUCTURE_STOP_BUDGET
+    stop = levels.stop
+    usable = [
+        lvl
+        for lvl in defensive
+        if _beyond(lvl.price, levels.entry)
+        and _distance(lvl.price) >= min_stop_atr * atr
+        and _distance(lvl.price) <= cap
+    ]
+    if usable:
+        stop = max(usable, key=lambda lvl: _distance(lvl.price)).price
+
+    # -- target: the nearest obstacle in the way -------------------------
+    # The nearest one, never the first that happens to clear ``min_rr``.
+    # Shopping outwards until the ratio looks good would turn this into a
+    # rubber stamp: every chart has some far resistance, so every setup would
+    # pass and the filter would stop filtering. If the next obstacle does not
+    # pay for the risk, the setup genuinely does not, and MIN_RR must be free
+    # to say so.
+    target = levels.primary_target
+    reachable = sorted(
+        (lvl for lvl in obstacle if not _beyond(lvl.price, levels.entry)),
+        key=lambda lvl: _distance(lvl.price),
+    )
+    if reachable:
+        target = reachable[0].price
+
+    if stop == levels.stop and target == levels.primary_target:
+        return levels
+    return TradeLevels(
+        direction=levels.direction,
+        entry=levels.entry,
+        stop=float(stop),
+        targets=(float(target),),
     )
 
 

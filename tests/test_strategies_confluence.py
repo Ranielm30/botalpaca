@@ -15,6 +15,7 @@ from botalpaca.confluence.engine import (
 )
 from botalpaca.confluence.entry_quality import format_entry_quality
 from botalpaca.domain.enums import Quality, SetupType, SignalDirection, TradingEnvironment
+from botalpaca.domain.models import StructureLevel
 from botalpaca.strategies.base import levels_from_atr, make_fingerprint
 from botalpaca.strategies.registry import StrategyEngine, build_strategies
 
@@ -111,19 +112,60 @@ def test_multi_timeframe_strategy_abstains_when_htf_unknown():
 
 
 def test_confluence_vetoes_low_rr():
+    """A setup whose next obstacle does not pay for the risk must be vetoed.
+
+    The signal below is deliberately unrecoverable: the nearest resistance sits
+    a few cents above the entry, so no placement of the stop rescues the ratio.
+    The shared snapshot's own levels would have improved this trade, which is
+    why it is not used here.
+    """
     snap = make_snapshot()
+    snap.structure.resistances = [StructureLevel(price=100.4, kind="resistance", touches=3)]
     signal = _signal(entry=100.0, stop=99.0, target=100.5)
     opp = _engine().score(snap, signal, environment=TradingEnvironment.PAPER)
+    assert opp.rr < MIN_RR
     assert opp.quality is Quality.NO_OPERABLE
     assert opp.tradable is False
     assert opp.non_tradable_reason
 
 
+def test_confluence_refines_levels_onto_real_structure():
+    """The stop goes to a tested level, the target to the next obstacle.
+
+    Both used to be ATR multiples, which made the ratio a constant 1.50 no
+    matter what the chart looked like.
+    """
+    snap = make_snapshot()
+    signal = _signal(entry=100.0, stop=96.0, target=112.0)
+    opp = _engine().score(snap, signal, environment=TradingEnvironment.PAPER)
+    assert opp.stop == pytest.approx(96.0)
+    assert opp.target == pytest.approx(104.0)
+    # 4 points of risk against 4 of reward, measured from the chart.
+    assert opp.rr == pytest.approx(1.0)
+    assert opp.rr != 1.5
+
+
 def test_confluence_tradable_requires_score_gate():
+    """Tradable is decided by the score and the gates, and the R:R is measured.
+
+    This test used to assert ``opp.rr >= MIN_RR``, which held only because the
+    levels were ATR multiples and the ratio was a constant 1.50. The levels now
+    come off real structure, so the ratio is a measurement and the assertion
+    moved to what the test is actually about: the score gate.
+    """
     snap = make_snapshot()
     signal = _signal(entry=100.0, stop=97.0, target=106.0)
     opp = _engine().score(snap, signal, environment=TradingEnvironment.PAPER)
-    assert opp.rr >= MIN_RR
+    # The snapshot's support is 96 and its resistance 104, so the structural
+    # trade is 4 points of risk against 4 of reward.
+    assert opp.stop == pytest.approx(96.0)
+    assert opp.target == pytest.approx(104.0)
+    assert opp.rr == pytest.approx(1.0)
+    # Below MIN_RR on real levels, so the setup is genuinely vetoed. Before the
+    # refinement this same setup reported 1.50 and sailed through.
+    assert opp.rr < MIN_RR
+    assert opp.quality is Quality.NO_OPERABLE
+    assert opp.tradable is False
     assert opp.tradable is (opp.score >= MIN_EXECUTABLE_SCORE and opp.quality is not Quality.NO_OPERABLE)
 
 

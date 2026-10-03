@@ -25,7 +25,7 @@ from botalpaca.domain import (
     TechnicalSnapshot,
     TradingEnvironment,
 )
-from botalpaca.strategies.base import make_fingerprint
+from botalpaca.strategies.base import TradeLevels, make_fingerprint, refine_levels_with_structure
 
 __all__ = ["ConfluenceEngine", "classify_quality", "WEIGHTS"]
 
@@ -138,6 +138,23 @@ class ConfluenceEngine:
             snapshot.symbol, signal.strategy, signal.direction, snapshot.timeframe
         )
 
+        # Put the levels on real structure before anything reads them. The
+        # strategy places them as ATR multiples, which makes the ratio a
+        # constant; this is the one place where both the signal and the chart's
+        # support/resistance are available, so the refinement happens here
+        # rather than in every strategy.
+        levels = refine_levels_with_structure(
+            TradeLevels(
+                direction=signal.direction,
+                entry=signal.entry,
+                stop=signal.stop,
+                targets=tuple(signal.targets) or (signal.entry,),
+            ),
+            getattr(snapshot, "structure", None),
+            snapshot.indicators.atr_14,
+            min_rr=MIN_RR,
+        )
+
         opportunity = Opportunity(
             symbol=snapshot.symbol,
             timeframe=snapshot.timeframe,
@@ -146,10 +163,10 @@ class ConfluenceEngine:
             direction=signal.direction,
             quality=Quality.NO_OPERABLE,
             score=round(score, 1),
-            entry=signal.entry,
-            stop=signal.stop,
-            target=signal.targets[0] if signal.targets else signal.entry,
-            rr=round(signal.rr, 2),
+            entry=levels.entry,
+            stop=levels.stop,
+            target=levels.primary_target,
+            rr=round(levels.rr, 2),
             strategy=signal.strategy,
             setup=signal.strategy,
             breakdown=breakdown,
@@ -164,7 +181,9 @@ class ConfluenceEngine:
             fingerprint=fingerprint,
         )
 
-        self._apply_tradability(opportunity, snapshot)
+        self._apply_tradability(
+            opportunity, snapshot, environment=opportunity.environment
+        )
         return opportunity
 
     # -- components ---------------------------------------------------------
@@ -325,16 +344,43 @@ class ConfluenceEngine:
 
     # -- tradability gate --------------------------------------------------
 
-    def _apply_tradability(self, opp: Opportunity, snapshot: TechnicalSnapshot) -> None:
+    def _shorts_allowed(self, environment: TradingEnvironment | None) -> bool:
+        """Whether a SHORT may be proposed in this environment.
+
+        Unknown environment means no shorts. Guessing "probably fine" is how a
+        paper-validated setup turns into a live margin call.
+        """
+        if environment is None:
+            return False
+        if environment is TradingEnvironment.REAL:
+            return bool(self.risk.allow_shorts_in_real)
+        return bool(self.risk.allow_shorts)
+
+    def _apply_tradability(
+        self,
+        opp: Opportunity,
+        snapshot: TechnicalSnapshot,
+        *,
+        environment: TradingEnvironment | None = None,
+    ) -> None:
         """Single authoritative gate. Sets ``quality`` and ``tradable`` together.
 
         Invariant: ``tradable`` is only ever ``True`` when quality is at
         least ``MEDIA`` and the score clears the execution floor.
+
+        ``environment`` matters for shorts: paper establishes locates
+        automatically and charges no borrow fees, live does neither. A setup
+        that is perfectly tradable in paper can be refused - or accepted and
+        then margin-called - with real money, so the environment decides rather
+        than a constant.
         """
         blocks: list[str] = []
         quality = classify_quality(
             opp.score, rr=opp.rr, data_quality=snapshot.data_quality
         )
+
+        if opp.direction is SignalDirection.SHORT and not self._shorts_allowed(environment):
+            blocks.append("cortos deshabilitados en este entorno (solo PAPER)")
 
         if quality is Quality.NO_OPERABLE:
             if opp.rr < MIN_RR:

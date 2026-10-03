@@ -98,6 +98,15 @@ class RiskSettings(BaseSettings):
     min_rr: float = Field(default=1.5, ge=0)
     min_liquidity_avg_dollar_volume: float = Field(default=2_000_000.0, ge=0)
     max_spread_pct: float = Field(default=0.5, ge=0)
+    # Short selling is only permitted in PAPER. Alpaca's own feature matrix
+    # shows short selling enabled in both environments, but live additionally
+    # charges borrow fees and, for hard-to-borrow names, requires an approved
+    # locate through the /v1/locates API. Paper has no borrow fees and
+    # establishes locates automatically, so a setup validated in paper would
+    # still be refused - or accepted and then margin-called - with real money.
+    # The gate lives here so the environment, not a constant, decides.
+    allow_shorts: bool = Field(default=True)
+    allow_shorts_in_real: bool = Field(default=False)
 
 
 class StrategySettings(BaseSettings):
