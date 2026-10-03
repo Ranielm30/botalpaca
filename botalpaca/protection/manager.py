@@ -316,6 +316,12 @@ class PositionProtectionManager:
 
         Returns the ids that could not be cleared, because the caller then knows
         its replacement exit is likely to be rejected.
+
+        A cancel that Alpaca *accepts* is not a cancel that Alpaca *completes*.
+        Reporting success on acceptance made reconcile print "ordenes inertes
+        liberadas" and then fail on the very next submit with the shares still
+        held, every single cycle. So the wait is here, before anything claims the
+        shares are back.
         """
         if not state.inert_order_ids:
             return []
@@ -341,15 +347,26 @@ class PositionProtectionManager:
                     error=str(exc),
                 )
         if cleared:
-            state.inert_order_ids = stuck
-            state.notes.append(
-                f"Ordenes inertes canceladas ({len(cleared)}) para liberar las acciones"
-            )
+            # Wait for the broker to actually let go of the shares. Only then is
+            # it true that the position can be re-protected.
+            if await self._await_shares_free(
+                environment, position.symbol, ignore=tuple(stuck)
+            ):
+                freed = len(cleared)
+            else:
+                # Still holding: report it as stuck rather than claim success.
+                stuck.extend(cleared)
+                freed = 0
+            state.inert_order_ids = list(stuck)
+            if freed:
+                state.notes.append(
+                    f"Ordenes inertes liberadas ({freed}): las acciones ya estan disponibles"
+                )
             log.info(
                 "protection.inert_cleared",
                 environment=environment.value,
                 symbol=position.symbol,
-                cleared=len(cleared),
+                cleared=freed,
                 stuck=len(stuck),
             )
         return stuck

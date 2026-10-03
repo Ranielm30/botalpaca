@@ -639,7 +639,34 @@ class Application:
             protect_missing=self.settings.protection.auto_protect_missing_stop,
         )
         log.info("app.reconciled", environment=environment.value, notes=len(notes))
+        await self._notify_reconciliation(environment, notes)
         return notes
+
+    async def _notify_reconciliation(
+        self, environment: TradingEnvironment, notes: list[str]
+    ) -> None:
+        """Tell the operator when reconciliation found something they must know.
+
+        These notes were only ever written to the log. A position that cannot be
+        protected is the single most important thing this process knows and the
+        one thing the operator cannot see -- silence on a stuck position reads
+        exactly like "everything is fine".
+        """
+        actionable = [n for n in notes if "🚨" in n or "❌" in n]
+        if not actionable:
+            return
+        text = "\n".join(
+            [
+                "<b>Aviso de proteccion</b>",
+                f"Entorno: {environment.value}",
+                "",
+                *actionable,
+            ]
+        )
+        try:
+            await self.notifications.send(text, force=True)
+        except Exception:  # noqa: BLE001 - a notice must never break reconciliation
+            log.exception("app.reconcile_notify_failed")
 
     async def health(self) -> HealthStatus:
         database_ok = await self.database.healthcheck()
