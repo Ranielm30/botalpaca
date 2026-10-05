@@ -61,6 +61,24 @@ class PortfolioRiskContext:
         return sum(p.notional for p in self.open_positions if p.symbol == symbol)
 
 
+def _status_is_active(status: object) -> bool:
+    """Whether an Alpaca account status means "you may trade".
+
+    ``str(AccountStatus.ACTIVE)`` is ``"AccountStatus.ACTIVE"`` on Python 3.11+,
+    not ``"ACTIVE"``. Comparing the repr against "ACTIVE" therefore fails for
+    every account, including healthy ones, and silently blocks 100% of entries
+    while printing the very status it rejected.
+    """
+    if status is None:
+        return True
+    value = getattr(status, "value", status)
+    text = str(value).strip().upper()
+    # Tolerate a prefixed repr such as "AccountStatus.ACTIVE".
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text in {"ACTIVE", ""}
+
+
 class RiskEngine:
     """Pre-trade risk validation and position sizing."""
 
@@ -180,8 +198,9 @@ class RiskEngine:
                 blocks.append("Cuenta bloqueada (account_blocked)")
             if acct.trade_suspended:
                 blocks.append("Trading suspendido por el usuario en Alpaca")
-            if str(acct.status).upper() not in {"ACTIVE", ""}:
-                blocks.append(f"Estado de cuenta no activo: {acct.status}")
+            if not _status_is_active(acct.status):
+                value = getattr(acct.status, "value", acct.status)
+                blocks.append(f"Estado de cuenta no activo: {value}")
 
         # --- loss limits ----------------------------------------------------
         await self._check_loss_limits(
