@@ -37,6 +37,7 @@ from botalpaca.domain import (
     TradePlan,
     TradingEnvironment,
 )
+from botalpaca.domain.enums import SignalDirection
 from botalpaca.domain.errors import BotalpacaError, ConfigurationError, ValidationError
 from botalpaca.execution import (
     ACTION_SUBMIT,
@@ -552,6 +553,53 @@ class Application:
             )
         return self.active.build_plan(opportunity, assessment), assessment
 
+    async def _check_levels_are_still_valid(self, plan: TradePlan) -> None:
+        """Refuse a bracket whose levels the market has already run past.
+
+        Alpaca validates a take-profit against ``base_price`` -- the price the
+        entry is expected to fill at, not the price the analysis was built from.
+        If the market moved between the scan and the tap, the target ends up on
+        the wrong side and the broker answers
+        ``take_profit.limit_price must be >= base_price + 0.01``, which tells the
+        operator nothing about what to do. Catching it here says it plainly.
+
+        Also enforces the sub-penny increment, because a price carrying every
+        decimal of the bar data is rejected outright with code 42210000.
+        """
+        if plan.stop_loss is None or plan.take_profit is None:
+            return
+
+        def _cent(value: float) -> float:
+            # Prices at or above $1.00 take two decimals; below that, four.
+            return round(value, 2 if value >= 1.0 else 4)
+
+        plan.stop_loss = _cent(plan.stop_loss)
+        plan.take_profit = _cent(plan.take_profit)
+
+        price = await self.active.market.get_last_price(plan.symbol)
+        if not price:
+            return
+        if plan.direction is SignalDirection.LONG:
+            target_ok = plan.take_profit > price
+            stop_ok = plan.stop_loss < price
+        else:
+            target_ok = plan.take_profit < price
+            stop_ok = plan.stop_loss > price
+
+        if target_ok and stop_ok:
+            return
+
+        problem = (
+            "el objetivo ya quedo por debajo del precio de mercado"
+            if not target_ok
+            else "el stop ya quedo por encima del precio de mercado"
+        )
+        raise ValidationError(
+            f"{plan.symbol}: {problem} (mercado ${price:,.2f}, "
+            f"objetivo ${plan.take_profit:,.2f}, stop ${plan.stop_loss:,.2f}). "
+            "El analisis quedo viejo: vuelve a ejecutar /analizar para tener niveles frescos."
+        )
+
     async def submit_plan(
         self,
         plan: TradePlan,
@@ -564,6 +612,7 @@ class Application:
         environment = self.active_environment
         self.security.allowlist.require(user_id)
         await self.security.ensure_trading_allowed()
+        await self._check_levels_are_still_valid(plan)
 
         result = await self.active.execution.submit(
             plan,

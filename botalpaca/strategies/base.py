@@ -179,11 +179,14 @@ def refine_levels_with_structure(
 
     if stop == levels.stop and target == levels.primary_target:
         return levels
+    # Alpaca rejects a price that breaks the sub-penny increment, and a raw
+    # structural level carries every decimal the bar data had: 1194.4686506181379
+    # came straight off a resistance. Prices at or above $1.00 take two decimals.
     return TradeLevels(
         direction=levels.direction,
         entry=levels.entry,
-        stop=float(stop),
-        targets=(float(target),),
+        stop=round(float(stop), 2),
+        targets=(round(float(target), 2),),
     )
 
 
