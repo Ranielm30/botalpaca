@@ -292,6 +292,67 @@ class OrderBuilder:
         return LimitOrderRequest(limit_price=float(limit_price), **common)
 
     @staticmethod
+    def build_oco_exits(
+        *,
+        symbol: str,
+        qty: float,
+        exit_side: SignalDirection,
+        stop_price: float,
+        take_profit_price: float,
+        time_in_force: TimeInForce = TimeInForce.GTC,
+        client_order_id: str | None = None,
+    ) -> LimitOrderRequest:
+        """Both exits for an open position, as the single group Alpaca allows.
+
+        Alpaca reserves the shares behind every open exit order, so two
+        independent orders for one position is not merely discouraged, it is
+        rejected with "insufficient qty available". The documented way to hold a
+        stop and a take-profit together on a position that is already open is an
+        OCO order: the parent is the take-profit limit and the stop is its
+        child. The parent type is always "limit" for an OCO, whichever side the
+        position is on.
+
+        Cancelling either leg cancels the group, so the manager must never treat
+        the held child as debris.
+        """
+        _require_positive(stop_price, "stop_price")
+        _require_positive(take_profit_price, "take_profit_price")
+        if qty <= 0:
+            raise ValidationError("oco qty must be positive")
+        # The stop must sit on the losing side of the target, which is what
+        # makes one of them a profit exit and the other a loss exit.
+        #
+        # Decided from the exit side, never from enum identity: the manager passes
+        # a PositionDirection while the strategies pass a SignalDirection, and
+        # two enums whose members share a name are still different objects, so
+        # `exit_side is SignalDirection.LONG` was silently always False and every
+        # long exit was validated with the short rule.
+        closing_long = alpaca_side(exit_side.exit_side) == AlpacaOrderSide.SELL
+        if closing_long and stop_price >= take_profit_price:
+            raise ValidationError(
+                "un OCO de salida necesita stop por debajo del objetivo"
+            )
+        if not closing_long and take_profit_price >= stop_price:
+            raise ValidationError(
+                "un OCO de salida necesita stop por encima del objetivo"
+            )
+        common: dict[str, Any] = {
+            "symbol": symbol.upper(),
+            "qty": abs(float(qty)),
+            "side": alpaca_side(exit_side.exit_side),
+            "time_in_force": alpaca_tif(time_in_force),
+            "order_class": AlpacaOrderClass.OCO,
+        }
+        if client_order_id:
+            common["client_order_id"] = client_order_id
+        return LimitOrderRequest(
+            limit_price=float(take_profit_price),
+            take_profit=TakeProfitRequest(limit_price=float(take_profit_price)),
+            stop_loss=StopLossRequest(stop_price=float(stop_price)),
+            **common,
+        )
+
+    @staticmethod
     def build_trailing_stop(
         *,
         symbol: str,

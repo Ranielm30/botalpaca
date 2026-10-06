@@ -86,7 +86,16 @@ async def _run(settings: Settings) -> int:
     bot_app.bot_data["application"] = app
 
     async def sender(text: str, keyboard: object = None) -> None:
-        for user_id in sorted(app.allowlist.allowed):
+        # The bot's own id can sit in the allowlist, and Telegram refuses a bot
+        # that messages itself: "Forbidden: the bot can't send messages to the
+        # bot". Skipping it keeps one bad entry from burying a real delivery in a
+        # stack trace.
+        me = bot_app.bot.id
+        targets = sorted(uid for uid in app.allowlist.allowed if uid != me)
+        if not targets:
+            log.warning("telegram.no_recipient", bot_id=me)
+            return
+        for user_id in targets:
             try:
                 await bot_app.bot.send_message(
                     chat_id=user_id, text=text, parse_mode="HTML", reply_markup=keyboard

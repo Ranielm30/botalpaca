@@ -1038,7 +1038,10 @@ class TelegramFacade:
             ]
         )
         return CommandResult(
-            body, confirm_keyboard(action="cerrar", token=f"{symbol}:{qty or percentage}")
+            body, confirm_keyboard(
+                action=kb.CLOSE_CONFIRM,
+                token=f"{symbol}:{qty or percentage}",
+            )
         )
 
     async def confirm_close(self, update: object, symbol: str, scope: str) -> CommandResult:

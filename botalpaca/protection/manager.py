@@ -26,6 +26,7 @@ from botalpaca.domain import (
     OrderClass,
     OrderSide,
     OrderState,
+    OrderType,
     PositionSnapshot,
     ProtectionKind,
     ProtectionState,
@@ -60,10 +61,46 @@ _TERMINAL = frozenset({"filled", "canceled", "expired", "replaced", "rejected"})
 _INERT_STATUSES = frozenset({"held", "pending_cancel", "pending_replace"})
 
 
-def _is_inert(order: OrderState) -> bool:
-    """True when an order still holds the shares but is not working protection."""
-    status = order_status_value(order)
-    return status in _INERT_STATUSES
+# Order classes that hold their exits as a group. Cancelling any one leg of a
+# group cancels all of them, so a leg that belongs to a live group must never be
+# treated as debris -- doing so is what tore a working take-profit down.
+_GROUP_CLASSES = {"oco", "bracket", "oto"}
+
+
+def _group_child_ids(orders: Sequence[OrderState]) -> set[str]:
+    """Ids of every exit order that belongs to a live advanced group.
+
+    Alpaca parks a group's stop in ``HELD`` so the shares are not reserved
+    twice, while the take-profit sits ``NEW`` as the parent. A ``HELD`` child of
+    such a group is working protection, not an orphan holding the position
+    hostage.
+    """
+    children: set[str] = set()
+    for order in orders:
+        if _class_value(order) not in _GROUP_CLASSES:
+            continue
+        for leg in getattr(order, "legs", None) or ():
+            if leg.id:
+                children.add(str(leg.id))
+    return children
+
+
+def _class_value(order: OrderState) -> str:
+    raw = getattr(order, "order_class", None)
+    if raw is None:
+        return ""
+    return str(getattr(raw, "value", raw)).strip().lower()
+
+
+def _is_inert(order: OrderState, *, protected_ids: set[str] | None = None) -> bool:
+    """True when an order holds the shares without being working protection.
+
+    A leg of a live bracket/OCO group is excluded: it is ``HELD`` by design and
+    it is the stop the position is relying on.
+    """
+    if protected_ids and str(order.id) in protected_ids:
+        return False
+    return order_status_value(order) in _INERT_STATUSES
 
 
 
@@ -158,13 +195,16 @@ class PositionProtectionManager:
         state = ProtectionState(symbol=symbol, environment=environment)
         if exit_side is None:
             exit_side = OrderSide.SELL
-        for order in orders:
-            if order.symbol.upper() != symbol:
-                continue
+        mine = [o for o in orders if o.symbol.upper() == symbol]
+        # Resolve group membership before judging anything: a HELD stop that
+        # belongs to a live OCO/bracket is the stop, not an orphan. Without
+        # this the bot cancels the group and takes the take-profit down with it.
+        protected = _group_child_ids(mine)
+        for order in mine:
             # A HELD order reserves the shares but can never execute. Treating it
             # as protection is what made the bot believe a stop was in place
             # while nothing could actually fire.
-            if _is_inert(order):
+            if _is_inert(order, protected_ids=protected):
                 state.inert_order_ids.append(order.id)
                 continue
             kind = _type_value(order)
@@ -414,6 +454,94 @@ class PositionProtectionManager:
 
     # ------------------------------------------------------------- protection
 
+    async def _merge_into_oco(
+        self,
+        environment: TradingEnvironment,
+        position: object,
+        state: ProtectionState,
+        *,
+        stop_price: float | None = None,
+    ) -> ProtectionState | None:
+        """Fold a standalone take-profit and the stop into one OCO group.
+
+        Two independent exits cannot share the shares, so the stop has to be
+        released before the target can be protected and vice versa. An OCO
+        carries both at once: the parent is the take-profit limit, the child is
+        the stop. Anything less leaves the operator with a risk number and no
+        target, which is exactly what a card advertising "R:R 1.5" must never do.
+        """
+        target = state.take_profit_price
+        stop = stop_price if stop_price is not None else state.stop_price
+        if target is None or stop is None:
+            return None
+        try:
+            request = OrderBuilder.build_oco_exits(
+                symbol=position.symbol,
+                qty=abs(position.qty),
+                exit_side=position.direction,
+                stop_price=stop,
+                take_profit_price=target,
+            )
+        except (ValidationError, ValueError) as exc:
+            log.warning("protection.oco_rejected", symbol=position.symbol, error=str(exc))
+            return None
+
+        # The standalone target must go before the group can take the shares.
+        if state.take_profit_order_id:
+            try:
+                await self._engine.cancel_order(
+                    state.take_profit_order_id, environment=environment
+                )
+            except (BotalpacaError, BrokerError, RuntimeError) as exc:
+                log.warning(
+                    "protection.target_release_failed",
+                    environment=environment.value,
+                    symbol=position.symbol,
+                    error=str(exc),
+                )
+                return None
+        await self._await_shares_free(
+            environment, position.symbol, ignore=state.inert_order_ids
+        )
+        result = await self._submit_exit(
+            environment=environment, request=request, symbol=position.symbol
+        )
+        if result.order is None or not result.order.id:
+            log.warning("protection.oco_unconfirmed", symbol=position.symbol)
+            return None
+        stop_id = result.order.id
+        for leg in result.order.legs or ():
+            if str(leg.order_type.value) == str(OrderType.STOP.value):
+                stop_id = leg.id or stop_id
+        await self._persist(
+            environment,
+            position.symbol,
+            qty=abs(position.qty),
+            entry_price=position.avg_entry_price,
+            stop_order_id=stop_id,
+            stop_price=stop,
+            take_profit_order_id=result.order.id,
+            take_profit_price=target,
+            order_class=OrderClass.OCO,
+        )
+        state.has_stop = True
+        state.stop_order_id = stop_id
+        state.stop_price = stop
+        state.has_take_profit = True
+        state.take_profit_order_id = result.order.id
+        state.take_profit_price = target
+        state.notes.append(f"Stop {stop} y objetivo {target} unidos en un OCO")
+        log.warning(
+            "protection.oco_created",
+            environment=environment.value,
+            symbol=position.symbol,
+            stop=stop,
+            take_profit=target,
+            parent=result.order.id,
+        )
+        return state
+
+
     async def ensure_stop(
         self,
         *,
@@ -434,45 +562,25 @@ class PositionProtectionManager:
         if state.has_stop:
             return state
 
-        # Alpaca reserves the shares for every open exit order, so a live
-        # take-profit blocks a stop on the very same position. Alpaca will not
-        # let two independent sell orders coexist, and it refuses an OTO whose
-        # legs sit on opposite sides of the primary price, which is exactly the
-        # long geometry of stop-below / target-above. The stop is the only exit
-        # that can be kept alive here, and an unprotected position is worse than
-        # one without a target: the target is recoverable by raising the stop as
-        # the trade works, a loss is not. So the take-profit is released.
+        # Alpaca reserves the shares behind every open exit order, so two
+        # independent exits on one position are rejected outright. The way to
+        # hold a stop AND a target is an OCO group, whose parent is the
+        # take-profit limit and whose child is the stop. It was live-verified on
+        # the paper account, so a missing target is never an excuse to drop one.
         if state.take_profit_order_id:
-            try:
-                await self._engine.cancel_order(
-                    state.take_profit_order_id, environment=environment
-                )
-            except (BotalpacaError, BrokerError, RuntimeError) as exc:
-                log.warning(
-                    "protection.target_release_failed",
-                    environment=environment.value,
-                    symbol=position.symbol,
-                    error=str(exc),
-                )
-                raise ValidationError(
-                    f"No se puede proteger {position.symbol}: su take-profit sigue "
-                    f"retendiendo las acciones y no se pudo cancelar ({exc}). "
-                    f"LA POSICION ESTA SIN STOP"
-                ) from exc
-            state.notes.append(
-                "Take-profit liberado: Alpaca reserva las acciones por orden y "
-                "no admite stop y target a la vez"
+            # The caller usually knows the level it wants; the state may carry
+            # none at all when there is no stop yet, which is exactly the case
+            # this branch exists for.
+            merged = await self._merge_into_oco(
+                environment, position, state, stop_price=stop_price
             )
-            log.warning(
-                "protection.target_released_for_stop",
-                environment=environment.value,
-                symbol=position.symbol,
-                take_profit_order_id=state.take_profit_order_id,
-                take_profit_price=state.take_profit_price,
-            )
-            state.has_take_profit = False
-            state.take_profit_order_id = None
-            state.take_profit_price = None
+            # The group already carries the stop. Falling through would build
+            # a bare stop on top of it, which takes the shares and leaves the
+            # operator with a stop and no target -- the exact state we just
+            # spent this round removing.
+            if merged is not None and merged.has_stop:
+                return merged
+
 
         price = stop_price if stop_price is not None else self._fallback_stop(position, atr)
         if price is None:
@@ -484,16 +592,31 @@ class PositionProtectionManager:
         await self._await_shares_free(
             environment, position.symbol, ignore=state.inert_order_ids
         )
-        result = await self._submit_exit(
-            environment=environment,
-            request=OrderBuilder.build_protective_stop(
+        # A broker refusal must reach the operator as a sentence about the
+        # position, not as a raw exception. An unprotected position is the one
+        # outcome they have to act on, so the wording says so plainly.
+        try:
+            result = await self._submit_exit(
+                environment=environment,
+                request=OrderBuilder.build_protective_stop(
+                    symbol=position.symbol,
+                    qty=abs(position.qty),
+                    exit_side=position.direction,
+                    stop_price=price,
+                ),
                 symbol=position.symbol,
-                qty=abs(position.qty),
-                exit_side=position.direction,
-                stop_price=price,
-            ),
-            symbol=position.symbol,
-        )
+            )
+        except (BotalpacaError, BrokerError, RuntimeError) as exc:
+            log.error(
+                "protection.stop_refused",
+                environment=environment.value,
+                symbol=position.symbol,
+                error=str(exc),
+            )
+            raise ValidationError(
+                f"No se pudo proteger {position.symbol}: {readable_reason(exc)}. "
+                "LA POSICION ESTA SIN STOP"
+            ) from exc
         if result.order is None or not result.order.id:
             raise ValidationError(
                 f"Alpaca no confirmó el stop de protección para {position.symbol}"

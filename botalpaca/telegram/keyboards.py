@@ -23,6 +23,10 @@ SIGNAL_DETAILS = "detalles"
 CONFIRM_TRADE = "confirmar"
 CANCEL_PENDING = "cancelar"
 CLOSE_POSITION = "cerrar"
+# Distinct from CLOSE_POSITION on purpose. The confirmation button used to
+# share the "cerrar" prefix, so the menu branch caught it first and fed a
+# confirmation token to the symbol parser.
+CLOSE_CONFIRM = "cerrar_ok"
 BREAK_EVEN = "be"
 TRAILING = "trail"
 CANCEL_ORDER = "cancelar_orden"
@@ -272,6 +276,7 @@ __all__ = [
     "CANCEL_ORDER",
     "CANCEL_PENDING",
     "CLOSE_POSITION",
+    "CLOSE_CONFIRM",
     "CONFIRM_ENV",
     "CONFIRM_TRADE",
     "HELP",

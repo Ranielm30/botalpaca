@@ -239,6 +239,8 @@ async def _route(
         return await facade.riesgo_detalle(update, payload)
     if action == kb.STATS_DETAIL:
         return await facade.stats(update, payload)
+    if action == kb.CLOSE_CONFIRM:
+        return await facade.confirm_close(update, *payload.split(":", 1))
     if action == kb.CLOSE_POSITION:
         return await facade.cerrar(update, payload)
     if action == kb.BREAK_EVEN:
