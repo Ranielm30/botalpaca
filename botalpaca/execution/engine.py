@@ -477,15 +477,35 @@ class ExecutionEngine:
 
         merged: dict[str, OrderState] = {}
         for order in rows:
-            if order_status_value(order) in _TERMINAL_STATUSES:
-                continue
             key = str(order.id)
             existing = merged.get(key)
             # The unnested row comes first, so a nested duplicate only wins when
             # it actually carries the group link the other one is missing.
             if existing is None or (not existing.legs and order.legs):
                 merged[key] = order
-        return list(merged.values())
+
+        # Group membership has to be settled BEFORE the terminal filter runs.
+        # The order carrying the parent-to-child link is the entry order, and an
+        # entry is FILLED the moment its bracket children exist -- so dropping
+        # terminal rows first throws away the only row that says a HELD stop
+        # belongs to a live group, and the stop then looks like debris.
+        child_of: dict[str, str] = {}
+        leg_ids: dict[str, set[str]] = {}
+        for order in merged.values():
+            members = {str(order.id)} | {str(leg.id) for leg in order.legs}
+            leg_ids[str(order.id)] = members
+            for leg in order.legs:
+                child_of[str(leg.id)] = str(order.id)
+
+        out: list[OrderState] = []
+        for order in merged.values():
+            if order_status_value(order) in _TERMINAL_STATUSES:
+                continue
+            key = str(order.id)
+            parent = child_of.get(key)
+            group = leg_ids.get(parent, {key}) if parent else leg_ids.get(key, {key})
+            out.append(order.model_copy(update={"group_ids": tuple(sorted(group))}))
+        return out
 
 
     # -- helpers -------------------------------------------------------------

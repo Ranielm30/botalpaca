@@ -402,6 +402,11 @@ class OrderState(Domain):
     created_at: dt.datetime | None = None
     updated_at: dt.datetime | None = None
     legs: list[OrderLeg] = Field(default_factory=list)
+    # Every order in the same advanced group, including this one. Alpaca
+    # parks a group's stop in HELD and hides it from nested queries, so the
+    # engine has to work the membership out and hand it over rather than
+    # leave protection to guess from the status alone.
+    group_ids: tuple[str, ...] = ()
     raw: dict[str, Any] = Field(default_factory=dict)
 
 

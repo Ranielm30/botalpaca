@@ -77,6 +77,19 @@ def _group_child_ids(orders: Sequence[OrderState]) -> set[str]:
     """
     children: set[str] = set()
     for order in orders:
+        # The engine already resolved membership, and it did so BEFORE dropping
+        # terminal rows -- because the only row carrying the parent-to-child
+        # link is the entry order, which is FILLED the moment its bracket
+        # children exist. Re-deriving it here from live rows alone misses
+        # exactly that parent and calls a working stop an orphan.
+        resolved = getattr(order, "group_ids", None)
+        if resolved:
+            for member in resolved:
+                if str(member) != str(order.id):
+                    children.add(str(member))
+            continue
+        # Fallback for orders that were not resolved, which is the old
+        # behaviour: read whatever the parent still carries.
         if _class_value(order) not in _GROUP_CLASSES:
             continue
         for leg in getattr(order, "legs", None) or ():
