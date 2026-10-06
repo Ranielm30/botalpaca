@@ -445,29 +445,48 @@ class ExecutionEngine:
         return [o for o in orders if o.symbol == target]
 
     async def get_live_orders(self, *, symbols: Sequence[str] | None = None) -> list[OrderState]:
-        """Orders that can still act, including the ones an OPEN query hides.
+        """Orders that can still act, each with the group it belongs to.
 
-        ``QueryOrderStatus`` only offers OPEN, CLOSED and ALL, so a bracket child
-        left in ``HELD`` is invisible to an OPEN query -- yet it still reserves the
-        shares. ``ALL`` is queried and terminal states are dropped here.
+        No single broker query answers the question protection has to ask, so
+        this issues two and unions them. Verified against the PAPER API:
 
-        ``nested`` must stay off. Verified against the PAPER API: the same query
-        returns 38 rows including the HELD order unnested, and 18 rows with zero
-        HELD when nested. Nesting folds children into the parent and drops the
-        ones that are not open, which is exactly the order protection has to
-        find. The children still arrive on the parent's ``legs``, so leaving
-        ``nested`` off costs nothing.
+        * ``nested=True`` gives every parent its ``legs``, which is the only
+          place the parent-to-child link exists -- but it hides the HELD
+          children entirely (the same query returned 18 rows with zero HELD
+          where the unnested one returned 38 with one).
+        * ``nested=False`` keeps the HELD rows -- the rows that still reserve
+          the shares and that protection must find -- but then every parent
+          arrives with an empty ``legs``.
+
+        Asking either question alone produces a wrong answer: nesting alone
+        makes a live stop look like debris, unnested alone makes a live stop's
+        own group invisible and so orphans it.
         """
         from alpaca.trading.enums import QueryOrderStatus
 
-        raw_orders = await self._client.get_orders(
-            status=QueryOrderStatus.ALL, limit=500, symbols=list(symbols) if symbols else None
-        )
-        return [
-            to_order_state(o, self.active_environment)
-            for o in raw_orders
-            if order_status_value(o) not in _TERMINAL_STATUSES
-        ]
+        wanted = list(symbols) if symbols else None
+        rows: list[OrderState] = []
+        for nested in (False, True):
+            raw_orders = await self._client.get_orders(
+                status=QueryOrderStatus.ALL,
+                limit=500,
+                nested=nested,
+                symbols=wanted,
+            )
+            rows.extend(to_order_state(o, self.active_environment) for o in raw_orders)
+
+        merged: dict[str, OrderState] = {}
+        for order in rows:
+            if order_status_value(order) in _TERMINAL_STATUSES:
+                continue
+            key = str(order.id)
+            existing = merged.get(key)
+            # The unnested row comes first, so a nested duplicate only wins when
+            # it actually carries the group link the other one is missing.
+            if existing is None or (not existing.legs and order.legs):
+                merged[key] = order
+        return list(merged.values())
+
 
     # -- helpers -------------------------------------------------------------
 
