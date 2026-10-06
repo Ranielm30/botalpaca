@@ -321,17 +321,23 @@ class PositionProtectionManager:
         request: object,
         *,
         ignore: Sequence[str] = (),
+        attempts: int = 4,
     ):
-        """Send an exit order, retrying once the broker frees the shares.
+        """Send an exit order, waiting out the broker's release of the shares.
 
-        Alpaca reserves the shares for every open exit order. Even after the old
-        leg is cancelled the create can still land while the release is in
-        flight, and it comes back as ``insufficient qty available ... naming the
-        order that was just cancelled``. Without this the trailing handover
-        never arms and the position keeps a stop the operator thinks has been
-        replaced.
+        Alpaca reserves the shares for every open exit order, and cancelling one
+        only *starts* the release: the order sits in ``pending_cancel`` and the
+        broker answers a create issued straight away with ``insufficient qty
+        available ... held_for_orders: N``, naming the very order that was just
+        cancelled. A single retry gave up inside that window and the trailing
+        handover never armed, so a trade that reached the trigger kept a stop the
+        operator believed had been replaced.
+
+        Each attempt therefore waits for the shares to actually come back before
+        trying again, and gives up only when the broker has demonstrably not
+        released them.
         """
-        for attempt in range(2):
+        for attempt in range(max(attempts, 1)):
             try:
                 return await self._engine.submit_protective(
                     environment=environment,
@@ -339,16 +345,21 @@ class PositionProtectionManager:
                     symbol=symbol,
                 )
             except (BrokerError, BotalpacaError, RuntimeError) as exc:
-                if "insufficient qty" not in str(exc) or attempt:
+                if "insufficient qty" not in str(exc):
                     raise
+                last = exc
                 log.info(
                     "protection.exit_resubmitting",
                     environment=environment.value,
                     symbol=symbol,
+                    attempt=attempt + 1,
                     error=str(exc),
                 )
+                if attempt + 1 >= max(attempts, 1):
+                    break
                 await self._await_shares_free(environment, symbol, ignore=ignore)
-        return None
+        raise last
+
 
     async def _await_shares_free(
         self,
