@@ -288,6 +288,11 @@ class TradePlan(Domain):
     order_type: OrderType = OrderType.MARKET
     time_in_force: TimeInForce = TimeInForce.DAY
     qty: float = 0.0
+    # The price the analysis was built on and the volatility it assumed. The
+    # gate approves a setup against that price, so the pair has to survive into
+    # execution to be re-checked against the live one.
+    entry: float = 0.0
+    atr: float = 0.0
     notional: float | None = None
     limit_price: float | None = None
     stop_loss: float | None = None

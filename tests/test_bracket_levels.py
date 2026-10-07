@@ -18,9 +18,12 @@ nothing about what to do.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from botalpaca.app import Application
+from botalpaca.config import RiskSettings
 from botalpaca.domain.enums import OrderClass, OrderType, SignalDirection, TradingEnvironment
 from botalpaca.strategies.base import TradeLevels, refine_levels_with_structure
 
@@ -74,8 +77,11 @@ def test_sub_penny_prices_keep_four_decimals():
 class _App:
     """Enough of Application to exercise the guard unbound."""
 
-    def __init__(self, price: float) -> None:
+    def __init__(self, price: float, risk: RiskSettings | None = None) -> None:
         self.price = price
+        # The guard reads its thresholds from settings.risk, so a stub without
+        # it would fail for the wrong reason.
+        self.settings = SimpleNamespace(risk=risk or RiskSettings())
         self.active = type(
             "_Active",
             (),
@@ -90,9 +96,11 @@ class _App:
         return self.price
 
 
-def _plan(*, long: bool = True, entry=100.0, stop=95.0, target=110.0):
+def _plan(*, long: bool = True, entry=100.0, stop=95.0, target=110.0, atr=5.0):
     from botalpaca.domain.models import TradePlan
 
+    # ``entry`` and ``atr`` are the price the analysis was built on and the
+    # volatility it assumed; the guard needs both to re-check the geometry.
     return TradePlan(
         symbol="AAPL",
         environment=PAPER,
@@ -100,6 +108,8 @@ def _plan(*, long: bool = True, entry=100.0, stop=95.0, target=110.0):
         order_type=OrderType.MARKET,
         qty=1.0,
         order_class=OrderClass.BRACKET,
+        entry=entry,
+        atr=atr,
         stop_loss=stop,
         take_profit=target,
     )
@@ -108,7 +118,7 @@ def _plan(*, long: bool = True, entry=100.0, stop=95.0, target=110.0):
 async def test_a_stale_target_is_refused_before_the_broker_sees_it():
     from botalpaca.domain.errors import ValidationError
 
-    app = _App(price=112.0)  # the market ran past the 110 target
+    app = _App(price=112.0, risk=RiskSettings(max_entry_drift_pct=99.0))  # past the 110 target
     with pytest.raises(ValidationError, match="objetivo ya quedo"):
         await Application._check_levels_are_still_valid(app, _plan())
 
@@ -116,7 +126,7 @@ async def test_a_stale_target_is_refused_before_the_broker_sees_it():
 async def test_a_stale_stop_is_refused():
     from botalpaca.domain.errors import ValidationError
 
-    app = _App(price=90.0)  # the market dropped below the 95 stop
+    app = _App(price=90.0, risk=RiskSettings(max_entry_drift_pct=99.0))  # below the 95 stop
     with pytest.raises(ValidationError, match="stop ya quedo"):
         await Application._check_levels_are_still_valid(app, _plan())
 
@@ -124,14 +134,14 @@ async def test_a_stale_stop_is_refused():
 async def test_a_short_is_mirrored():
     from botalpaca.domain.errors import ValidationError
 
-    app = _App(price=88.0)
+    app = _App(price=88.0, risk=RiskSettings(max_entry_drift_pct=99.0))
     plan = _plan(long=False, entry=100.0, stop=105.0, target=90.0)
     with pytest.raises(ValidationError, match="objetivo ya quedo"):
         await Application._check_levels_are_still_valid(app, plan)
 
 
 async def test_a_fresh_setup_passes_and_gets_rounded():
-    app = _App(price=100.5)
+    app = _App(price=100.5, risk=RiskSettings(max_entry_drift_pct=99.0))
     plan = _plan(stop=99.65432109876543, target=114.693456789)
     await Application._check_levels_are_still_valid(app, plan)
     assert plan.stop_loss == 99.65

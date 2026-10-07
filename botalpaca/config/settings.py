@@ -105,6 +105,21 @@ class RiskSettings(BaseSettings):
     # establishes locates automatically, so a setup validated in paper would
     # still be refused - or accepted and then margin-called - with real money.
     # The gate lives here so the environment, not a constant, decides.
+    # -- entry geometry guards ------------------------------------------------
+    # The gate approves a setup against the price it analysed. Between that
+    # moment and the fill the market can move far enough to destroy the
+    # geometry without breaking either level's sign, so the ratio is re-derived
+    # at the live price before anything reaches Alpaca. LLY was approved at
+    # 1.5 R:R on $1105.06 and filled at $1176.00: a real 0.08 with a target
+    # 0.86% away.
+    min_rr_at_entry: float = Field(default=1.5)
+    max_entry_drift_pct: float = Field(default=0.5)
+    min_target_distance_atr: float = Field(default=1.0)
+    min_target_distance_pct: float = Field(default=1.0)
+    # A long bought at RSI 85 is not a trend entry, it is the end of one. LLY
+    # was taken twice this way (RSI 85 and 87).
+    max_rsi_for_long: float = Field(default=75.0)
+
     allow_shorts: bool = Field(default=True)
     allow_shorts_in_real: bool = Field(default=False)
 

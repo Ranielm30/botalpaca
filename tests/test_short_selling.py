@@ -21,6 +21,8 @@ saw. So the environment decides, not a constant.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 
 from botalpaca.config import RiskSettings
@@ -76,6 +78,9 @@ def test_the_defaults_match_the_alpaca_feature_matrix():
 class _Snapshot:
     atr = 2.0
     data_quality = 1.0
+    # The overbought-long guard reads the RSI off the snapshot, so a double
+    # without indicators would fail before the short gate is ever consulted.
+    indicators = SimpleNamespace(rsi_14=55.0)
 
 
 def _short_opportunity(**kw):

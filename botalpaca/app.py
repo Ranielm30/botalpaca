@@ -260,6 +260,8 @@ class EnvironmentContext:
             direction=opportunity.direction,
             order_type=OrderType.MARKET,
             qty=qty,
+            entry=opportunity.entry,
+            atr=opportunity.atr or 0.0,
             stop_loss=opportunity.stop,
             take_profit=opportunity.target,
             order_class=OrderClass.BRACKET,
@@ -554,20 +556,23 @@ class Application:
         return self.active.build_plan(opportunity, assessment), assessment
 
     async def _check_levels_are_still_valid(self, plan: TradePlan) -> None:
-        """Refuse a bracket whose levels the market has already run past.
+        """Refuse a bracket the market has already moved away from.
 
-        Alpaca validates a take-profit against ``base_price`` -- the price the
-        entry is expected to fill at, not the price the analysis was built from.
-        If the market moved between the scan and the tap, the target ends up on
-        the wrong side and the broker answers
-        ``take_profit.limit_price must be >= base_price + 0.01``, which tells the
-        operator nothing about what to do. Catching it here says it plainly.
+        The gate approves a setup against the price it analysed. Between that
+        moment and the tap the market can travel far enough to destroy the
+        geometry without breaking either level's sign, so the ratio is
+        re-derived at the live price before anything reaches Alpaca. LLY was
+        approved at 1.5 R:R on $1105.06 and filled at $1176.00: a real 0.08 with
+        the target 0.86% away and a stop 10.6% out. Every level was still on the
+        correct side, so a sign check waved it through.
 
-        Also enforces the sub-penny increment, because a price carrying every
-        decimal of the bar data is rejected outright with code 42210000.
+        Raises ``ValidationError`` tagged with the reason so the operator knows
+        which guard spoke.
         """
         if plan.stop_loss is None or plan.take_profit is None:
             return
+
+        risk = self.settings.risk
 
         def _cent(value: float) -> float:
             # Prices at or above $1.00 take two decimals; below that, four.
@@ -577,8 +582,27 @@ class Application:
         plan.take_profit = _cent(plan.take_profit)
 
         price = await self.active.market.get_last_price(plan.symbol)
-        if not price:
+        if not price or not plan.entry:
             return
+
+        def _reject(reason: str, tag: str) -> ValidationError:
+            return ValidationError(
+                f"{plan.symbol}: {reason} (analizado ${plan.entry:,.2f}, "
+                f"mercado ${price:,.2f}, objetivo ${plan.take_profit:,.2f}, "
+                f"stop ${plan.stop_loss:,.2f}) [{tag}]. "
+                "El analisis quedo viejo: vuelve a ejecutar /analizar "
+                "para tener niveles frescos."
+            )
+
+        # 1. Drift: the levels belong to a price the trade will never get.
+        drift_pct = abs(price - plan.entry) / plan.entry * 100.0
+        if drift_pct > risk.max_entry_drift_pct:
+            raise _reject(
+                f"el precio se movio {drift_pct:.2f}%, mas del "
+                f"{risk.max_entry_drift_pct:.2f}% permitido",
+                "REJECTED_PRICE_DRIFT",
+            )
+
         if plan.direction is SignalDirection.LONG:
             target_ok = plan.take_profit > price
             stop_ok = plan.stop_loss < price
@@ -586,19 +610,41 @@ class Application:
             target_ok = plan.take_profit < price
             stop_ok = plan.stop_loss > price
 
-        if target_ok and stop_ok:
-            return
+        if not target_ok or not stop_ok:
+            problem = (
+                "el objetivo ya quedo del lado equivocado del mercado"
+                if not target_ok
+                else "el stop ya quedo del lado equivocado del mercado"
+            )
+            raise _reject(problem, "REJECTED_LEVEL_SIDE")
 
-        problem = (
-            "el objetivo ya quedo por debajo del precio de mercado"
-            if not target_ok
-            else "el stop ya quedo por encima del precio de mercado"
+        # 2. Target proximity: a target a whisker away pays nothing for the risk.
+        remaining = abs(plan.take_profit - price)
+        floor_pct = risk.min_target_distance_pct
+        floor_atr = (
+            risk.min_target_distance_atr * plan.atr
+            if plan.atr and plan.atr > 0
+            else 0.0
         )
-        raise ValidationError(
-            f"{plan.symbol}: {problem} (mercado ${price:,.2f}, "
-            f"objetivo ${plan.take_profit:,.2f}, stop ${plan.stop_loss:,.2f}). "
-            "El analisis quedo viejo: vuelve a ejecutar /analizar para tener niveles frescos."
-        )
+        floor = max(price * floor_pct / 100.0, floor_atr)
+        if remaining < floor:
+            raise _reject(
+                f"el objetivo esta a {remaining:,.2f} ({remaining / price * 100:.2f}%), "
+                f"menos de lo exigido ({floor:,.2f})",
+                "REJECTED_TARGET_TOO_CLOSE",
+            )
+
+        # 3. Re-derive the ratio at the price the trade will actually get.
+        reward = abs(plan.take_profit - price)
+        risk_usd = abs(price - plan.stop_loss)
+        rr_now = reward / risk_usd if risk_usd > 0 else 0.0
+        if rr_now < risk.min_rr_at_entry:
+            raise _reject(
+                f"el R:R ahora es {rr_now:.2f}, por debajo del minimo "
+                f"{risk.min_rr_at_entry:.2f} (venia {plan.rr:.2f})",
+                "REJECTED_DEGRADED_RR",
+            )
+
 
     async def submit_plan(
         self,

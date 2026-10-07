@@ -391,6 +391,17 @@ class ConfluenceEngine:
                 blocks.append(f"score {opp.score:.0f} demasiado bajo")
         if opp.atr is None or opp.atr <= 0:
             blocks.append("ATR no disponible para dimensionar el stop")
+        # A long bought at RSI 85 is not a trend entry, it is the end of one.
+        # LLY was taken twice this way (RSI 85 and 87) and both trades were
+        # immediately underwater. The score never punished it: a strong trend
+        # pushes RSI up, which is exactly when the setup is worst.
+        rsi = getattr(snapshot.indicators, "rsi_14", None)
+        if opp.direction is SignalDirection.LONG and rsi is not None:
+            if rsi > self.risk.max_rsi_for_long:
+                blocks.append(
+                    f"RSI {rsi:.0f} en sobrecompra extrema para un largo "
+                    f"(maximo {self.risk.max_rsi_for_long:.0f})"
+                )
         stop_distance_pct = (
             abs(opp.entry - opp.stop) / opp.entry * 100.0 if opp.entry > 0 else 0.0
         )
