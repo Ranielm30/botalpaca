@@ -1249,6 +1249,18 @@ class PositionProtectionManager:
                     )
                 else:
                     notes.append(f"🧹 {symbol}: ordenes inertes liberadas")
+            # Done before the trailing check below, which ``continue``s: an
+            # orphan whose only exit is a trailing stop still needs its row.
+            if symbol not in stored:
+                # Alpaca holds the position but SQLite never heard of it: the
+                # entry predates the protection ledger, or the row was cleared
+                # while the shares stayed reserved. Adopt it for real, or the
+                # frozen-risk baseline stays NULL forever and every R rule
+                # falls back to a stop that moves with the trade.
+                await self._adopt_orphan(environment, symbol, position, state)
+                notes.append(
+                    f"ℹ️ {symbol}: adoptada en SQLite (posición huérfana de Alpaca)"
+                )
             # A trailing stop is the exit for this position, so it counts as
             # protection. Asking for a fixed stop on top of it fails anyway --
             # Alpaca reserves the shares for the trailing order and rejects the
@@ -1273,9 +1285,6 @@ class PositionProtectionManager:
                         f"❌ {symbol}: SIN stop — {readable_reason(exc)}"
                     )
                     log.error("protection.reconcile.failed", symbol=symbol, error=str(exc))
-            if symbol not in stored:
-                notes.append(f"ℹ️ {symbol}: adoptada en SQLite (posición huérfana de Alpaca)")
-
         for symbol in sorted(set(stored) - set(live)):
             await self.clear(environment, symbol)
             notes.append(f"🧹 {symbol}: protección borrada (ya no hay posición en Alpaca)")
@@ -1285,6 +1294,41 @@ class PositionProtectionManager:
         return notes
 
     # ---------------------------------------------------------------- helpers
+
+    async def _adopt_orphan(
+        self,
+        environment: TradingEnvironment,
+        symbol: str,
+        position: PositionSnapshot,
+        state: ProtectionState,
+    ) -> None:
+        """Write the protection row for a position Alpaca holds and SQLite lost.
+
+        The exits recorded here are the ones Alpaca already accepted, so nothing
+        is ordered: this only makes the row agree with the broker.
+
+        The frozen baseline is taken from the stop live *at adoption time*. For
+        a trade entered through ``register_entry_protection`` this method never
+        runs and the true opening stop is what gets frozen; for an orphan that
+        opened before the ledger existed the live stop is the earliest evidence
+        left, and it is frozen from here on so R stops moving.
+        """
+        async with self._db.session() as session:
+            repo = ProtectionRepository(session)
+            await repo.upsert(
+                environment,
+                symbol,
+                qty=abs(position.qty),
+                entry_price=position.avg_entry_price,
+                stop_price=state.stop_price,
+                take_profit_price=state.take_profit_price,
+                trail_percent=state.trail_percent,
+                stop_order_id=state.stop_order_id,
+                take_profit_order_id=state.take_profit_order_id,
+                trailing_order_id=state.trailing_order_id,
+                order_class=getattr(state.order_class, "value", state.order_class),
+            )
+            await repo.record_initial_stop(environment, symbol, state.stop_price)
 
     async def _persist(
         self, environment: TradingEnvironment, symbol: str, **values: object

@@ -84,6 +84,21 @@ class TradeRepository:
         )
         return (await self._s.execute(stmt)).scalars().first()
 
+    async def get_open_by_id(
+        self, trade_id: int, environment: TradingEnvironment
+    ) -> TradeModel | None:
+        """The one OPEN row with this id.
+
+        Settling a trade must not depend on which row happens to be newest for
+        a symbol, so the id is resolved directly.
+        """
+        stmt = (
+            self._base(environment)
+            .where(TradeModel.id == trade_id)
+            .where(TradeModel.status == TradeStatus.OPEN.value)
+        )
+        return (await self._s.execute(stmt)).scalar_one_or_none()
+
     async def get_pending(
         self, environment: TradingEnvironment
     ) -> Sequence[TradeModel]:

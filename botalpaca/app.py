@@ -22,7 +22,7 @@ from botalpaca.analysis import analyze_symbol
 from botalpaca.config.logging import get_logger
 from botalpaca.config.settings import Settings, get_settings
 from botalpaca.confluence import ConfluenceEngine, EntryQualityExplainer
-from botalpaca.db import Database, set_database
+from botalpaca.db import Database, TradeModel, TradeRepository, set_database
 from botalpaca.domain import (
     AccountSnapshot,
     HealthStatus,
@@ -66,6 +66,41 @@ from botalpaca.security import (
 from botalpaca.strategies import StrategyEngine
 
 log = get_logger(__name__)
+
+
+@dataclass(frozen=True)
+class _ExitFill:
+    """One filled Alpaca order that reduced or closed a position."""
+
+    order_id: str
+    order_type: str
+    price: float
+    qty: float
+    filled_at: dt.datetime
+
+
+def _classify_exit(fills: list[_ExitFill], row: TradeModel) -> tuple[str, str]:
+    """Name the exit from which order actually filled.
+
+    A bracket or OCO pair is a take-profit limit order plus a stop-loss stop
+    order, and Alpaca cancels whichever leg loses. So the leg that filled is
+    the whole story of how the trade ended, which is why the stored order ids
+    are checked before falling back to the order kind.
+    """
+    ids = {f.order_id for f in fills}
+    kinds = {f.order_type for f in fills}
+
+    if row.stop_order_id and str(row.stop_order_id) in ids:
+        return "STOP", "Stop de protección llenado en Alpaca"
+    if row.take_profit_order_id and str(row.take_profit_order_id) in ids:
+        return "TARGET", "Take profit llenado en Alpaca"
+    if "trailing_stop" in kinds:
+        return "TRAILING", "Stop trailing llenado en Alpaca"
+    if kinds & {"stop", "stop_limit"}:
+        return "STOP", "Stop llenado en Alpaca"
+    if "limit" in kinds:
+        return "TARGET", "Orden límite de salida llenada en Alpaca"
+    return "MANUAL", "Cierre manual en Alpaca"
 
 #: Callback used to push a rendered message plus an optional Telegram keyboard.
 Sender = Callable[[str, object], Awaitable[None]]
@@ -736,9 +771,140 @@ class Application:
             positions=positions,
             protect_missing=self.settings.protection.auto_protect_missing_stop,
         )
+        notes.extend(await self._settle_finished_trades(environment, positions))
         log.info("app.reconciled", environment=environment.value, notes=len(notes))
         await self._notify_reconciliation(environment, notes)
         return notes
+
+    # ------------------------------------------------------------ settling the ledger
+
+    async def _settle_finished_trades(
+        self, environment: TradingEnvironment, positions: list[PositionSnapshot]
+    ) -> list[str]:
+        """Close ledger rows for trades the broker has already finished.
+
+        Alpaca fills a protective stop or a take-profit without being asked, so
+        the position disappears from the broker while the ledger keeps saying
+        OPEN. Nothing used to read that gap. A trade that ended at the stop went
+        on counting as open risk, kept its capital reserved, and never reached
+        the statistics. Reconciliation is already the one place that compares
+        SQLite against Alpaca, so the settlement belongs here.
+        """
+        live = {p.symbol.upper() for p in positions if p.qty != 0}
+        async with self.database.session() as session:
+            rows = list(await TradeRepository(session).get_open_positions(environment))
+
+        notes: list[str] = []
+        for row in rows:
+            # Reading the symbol is inside the guard on purpose: a row this
+            # process cannot even name must not abort the whole cycle and
+            # leave every other finished trade unsettled.
+            try:
+                symbol = row.symbol.upper()
+                if symbol in live:
+                    continue
+                note = await self._settle_trade(environment, row)
+            except Exception as exc:  # noqa: BLE001 - one row must not stop the rest
+                log.exception("app.settle_trade_failed", error=str(exc))
+                notes.append(f"⚠️ {getattr(row, 'symbol', '?')}: no se pudo cerrar en el ledger ({exc})")
+                continue
+            if note is not None:
+                notes.append(note)
+        return notes
+
+    async def _settle_trade(self, environment: TradingEnvironment, row: TradeModel) -> str | None:
+        """Settle one trade whose position is gone. Returns a note, or None."""
+        from alpaca.trading.enums import QueryOrderStatus
+
+        symbol = row.symbol.upper()
+        is_long = str(row.direction).upper().endswith("LONG")
+        entry = float(row.entry_price or 0.0)
+        qty = float(row.qty or 0.0)
+
+        fills = await self._exit_fills(row, is_long, QueryOrderStatus)
+        if fills:
+            filled_qty = sum(f.qty for f in fills)
+            exit_price = sum(f.price * f.qty for f in fills) / filled_qty
+            exit_reason, exit_note = _classify_exit(fills, row)
+            pnl = (
+                (exit_price - entry) * filled_qty
+                if is_long
+                else (entry - exit_price) * filled_qty
+            )
+        elif row.filled_at is None:
+            # No position and no exit: the entry never executed.
+            exit_price, pnl = entry, 0.0
+            exit_reason = "ENTRADA_NO_EJECUTADA"
+            exit_note = "Alpaca no tiene posición y no registra ninguna salida"
+        else:
+            # The position is gone but no exit order can be tied to this trade.
+            # Pricing it at the last quote is an estimate, and the note says so,
+            # because a silently wrong P&L corrupts the statistics forever.
+            exit_price = float(await self.active.market.get_last_price(symbol) or entry)
+            pnl = (exit_price - entry) * qty if is_long else (entry - exit_price) * qty
+            exit_reason = "CIERRE_SIN_REGISTRO"
+            exit_note = (
+                f"Sin orden de salida en Alpaca; precio estimado {exit_price:,.2f}"
+            )
+
+        closed = await self.journal.close_trade(
+            environment=environment,
+            symbol=symbol,
+            exit_price=exit_price,
+            pnl=pnl,
+            exit_reason=exit_reason,
+            exit_reason_note=exit_note,
+            exit_order_id=fills[0].order_id if fills else None,
+            trade_id=row.id,
+        )
+        if closed is None:
+            return None
+        return (
+            f"📕 {symbol}: cerrada en el ledger por {exit_reason} "
+            f"a {exit_price:,.2f} (P&L {pnl:+,.2f}, R {closed.r_multiple:+.2f})"
+        )
+
+    async def _exit_fills(self, row: TradeModel, is_long: bool, status_enum: object) -> list[_ExitFill]:
+        """The filled orders Alpaca used to close this trade, oldest first.
+
+        Filtered by side, by fill status, and by time: an older trade on the
+        same symbol also produced exits, and counting those would invent a P&L
+        that this trade never earned.
+        """
+        want_side = "sell" if is_long else "buy"
+        orders = await self.active.trading_client.get_orders(
+            status=status_enum.CLOSED,
+            symbols=[row.symbol.upper()],
+            limit=100,
+            nested=True,
+        )
+        opened_at = row.opened_at
+        if opened_at is not None and opened_at.tzinfo is None:
+            opened_at = opened_at.replace(tzinfo=dt.UTC)
+
+        fills: list[_ExitFill] = []
+        for order in orders:
+            if str(getattr(order.side, "value", order.side)).lower() != want_side:
+                continue
+            if str(getattr(order.status, "value", order.status)).lower() != "filled":
+                continue
+            if not order.filled_at or not order.filled_qty:
+                continue
+            filled_at = order.filled_at
+            if filled_at.tzinfo is None:
+                filled_at = filled_at.replace(tzinfo=dt.UTC)
+            if opened_at is not None and filled_at < opened_at:
+                continue
+            fills.append(
+                _ExitFill(
+                    order_id=str(order.id),
+                    order_type=str(getattr(order.type, "value", order.type)),
+                    price=float(order.filled_avg_price or 0.0),
+                    qty=float(order.filled_qty),
+                    filled_at=filled_at,
+                )
+            )
+        return sorted(fills, key=lambda f: f.filled_at)
 
     async def _notify_reconciliation(
         self, environment: TradingEnvironment, notes: list[str]

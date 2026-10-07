@@ -247,11 +247,22 @@ class TradeJournal:
         exit_order_id: str | None = None,
         mfe: float | None = None,
         mae: float | None = None,
+        trade_id: int | None = None,
     ) -> TradeModel | None:
+        """Close an open trade.
+
+        ``trade_id`` names the exact row to settle. Callers that already know
+        which trade they are looking at pass it, because picking "the newest
+        open row for this symbol" is only a guess: two OPEN rows on one symbol
+        means the guess can close the wrong one.
+        """
         now = dt.datetime.now(dt.UTC)
         async with self._db.session() as session:
             repo = TradeRepository(session)
-            row = await repo.get_open_for_symbol(symbol, environment)
+            if trade_id is None:
+                row = await repo.get_open_for_symbol(symbol, environment)
+            else:
+                row = await repo.get_open_by_id(trade_id, environment)
             if row is None:
                 log.warning("journal.close.not_found", symbol=symbol, environment=environment.value)
                 return None

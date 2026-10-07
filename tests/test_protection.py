@@ -355,3 +355,64 @@ async def test_reconcile_never_creates_real_protection_for_paper_positions(datab
     async with database.session() as session:
         rows = await ProtectionRepository(session).all_for(TradingEnvironment.REAL)
     assert not rows
+
+
+async def test_reconcile_adopts_a_position_sqlite_never_saw(database):
+    """A live position with no row used to be reported and then forgotten.
+
+    The note said it had been adopted while nothing was written, so the
+    frozen-risk baseline stayed NULL for the whole life of the trade.
+    """
+    manager, engine, _ = await _setup(
+        database, [_stop_order("s1", stop=97.0), _tp_order("t1")]
+    )
+    position = make_position(symbol="AAPL", entry=100.0, current=102.0)
+
+    notes = await manager.reconcile(
+        environment=PAPER, positions=[position], protect_missing=True
+    )
+
+    assert any("adoptada" in n for n in notes)
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "AAPL")
+    assert row is not None
+    assert row.qty == pytest.approx(position.qty)
+    assert row.entry_price == pytest.approx(100.0)
+    assert row.stop_order_id == "s1"
+    assert row.take_profit_order_id == "t1"
+
+
+async def test_adoption_freezes_the_baseline_and_never_rewrites_it(database):
+    manager, engine, _ = await _setup(database, [_stop_order("s1", stop=97.0)])
+    position = make_position(symbol="AAPL", entry=100.0, current=102.0)
+
+    await manager.reconcile(environment=PAPER, positions=[position], protect_missing=True)
+    async with database.session() as session:
+        frozen = (await ProtectionRepository(session).get(PAPER, "AAPL")).initial_stop_price
+    assert frozen == pytest.approx(97.0)
+
+    # The stop is ratcheted up. The baseline must not follow it, or R would
+    # shrink every time the trade protects itself.
+    await manager.move_to_break_even(
+        environment=PAPER, position=make_position(entry=100.0, current=103.0)
+    )
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "AAPL")
+    assert row.stop_price > frozen
+    assert row.initial_stop_price == pytest.approx(frozen)
+
+
+async def test_adoption_does_not_reorder_anything_on_alpaca(database):
+    """Adoption only records exits Alpaca already accepted."""
+    manager, engine, client = await _setup(database)
+    position = make_position(symbol="AAPL", entry=100.0, current=102.0)
+
+    await manager.reconcile(
+        environment=PAPER, positions=[position], protect_missing=False
+    )
+
+    assert client.submitted == []
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "AAPL")
+    assert row is not None
+    assert row.stop_order_id is None
