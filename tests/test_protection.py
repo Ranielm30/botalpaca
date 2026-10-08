@@ -229,6 +229,41 @@ async def test_trailing_stop_uses_atr_when_larger(database):
     assert state.trail_percent and state.trail_percent > 2.0
 
 
+async def test_arming_a_trail_does_not_loosen_the_stop_already_in_place(database):
+    """The bridge stop must not hand back protection that was already earned.
+
+    Break-even was secured at 100.50 and the price sits at 102. Deriving the
+    bridge stop from the price alone gives 102 * (1 - 2% * 1.5) = 98.94, which
+    is looser than what the position already had: arming a trailing stop made
+    the position *less* protected.
+    """
+    manager, engine, client = await _setup(database, [_stop_order("s1", stop=100.5)])
+
+    await manager.enable_trailing_stop(
+        environment=PAPER, position=make_position(entry=100.0, current=102.0), trail_percent=2.0
+    )
+
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "AAPL")
+    assert row.stop_price == 100.5
+
+
+async def test_arming_a_trail_on_a_short_does_not_loosen_the_stop(database):
+    """The mirror rule: for a short the stop only ever moves down."""
+    # A short is closed by buying, so its protective stop is a buy stop.
+    buy_stop = fake_order_raw(
+        "s1", symbol="AAPL", order_type="stop", side="buy", stop_price=103.5, status="new"
+    )
+    manager, engine, client = await _setup(database, [buy_stop])
+    short = make_position(qty=-10.0, entry=100.0, current=102.0)
+
+    await manager.enable_trailing_stop(environment=PAPER, position=short, trail_percent=2.0)
+
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "AAPL")
+    assert row.stop_price == 103.5
+
+
 async def test_disable_trailing_stop(database):
 
     manager, engine, client = await _setup(database)

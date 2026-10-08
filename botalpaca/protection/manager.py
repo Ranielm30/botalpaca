@@ -1060,6 +1060,18 @@ class PositionProtectionManager:
             position.current_price * (1 - offset) if long_position else position.current_price * (1 + offset),
             2,
         )
+        # The replacement exists only to hold the position for the one round-trip
+        # it takes to arm the real trailing order. It must never sit looser than
+        # the stop already protecting the position: deriving it from the price
+        # alone used to push it below the break-even that had been secured, and
+        # the position ended up less protected after "adding" a trailing stop
+        # than before. Tighten it to the stop already in place whenever that is
+        # still a legal stop (on the protected side of the market).
+        if state.stop_price is not None:
+            if long_position and state.stop_price < position.current_price:
+                provisional = max(provisional, round(state.stop_price, 2))
+            elif not long_position and state.stop_price > position.current_price:
+                provisional = min(provisional, round(state.stop_price, 2))
 
         stale = [oid for oid in (state.stop_order_id, state.take_profit_order_id) if oid]
         cancelled: list[str] = []
