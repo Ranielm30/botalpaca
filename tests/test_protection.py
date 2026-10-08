@@ -500,3 +500,74 @@ async def test_a_target_the_market_has_already_passed_is_refused(database):
             position=make_position(symbol="AAPL", entry=100.0, current=102.0),
             target_price=98.0,
         )
+
+
+async def test_a_target_added_over_a_live_stop_lets_that_stop_go_first(database):
+    """Alpaca counts a stop's shares as held, so the group cannot land on top
+    of it. The stop is released, and the group carries it from then on."""
+    manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0)])
+    await manager._persist(
+        PAPER,
+        "AAPL",
+        qty=10.0,
+        entry_price=100.0,
+        stop_order_id="s1",
+        stop_price=97.0,
+    )
+
+    merged = await manager.ensure_take_profit(
+        environment=PAPER,
+        position=make_position(symbol="AAPL", entry=100.0, current=102.0),
+        target_price=110.0,
+    )
+
+    assert "s1" in client.cancelled
+    assert merged.has_take_profit and merged.has_stop
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "AAPL")
+    assert row.take_profit_order_id is not None
+    assert row.stop_order_id != "s1"
+    assert row.stop_price == 97.0
+
+
+async def test_a_group_that_fails_leaves_the_stop_back_in_place(database, monkeypatch):
+    """Releasing the stop is the only way through, so it has to come back if
+    the group does not land. The position must not be left unprotected."""
+    manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0)])
+    await manager._persist(
+        PAPER,
+        "AAPL",
+        qty=10.0,
+        entry_price=100.0,
+        stop_order_id="s1",
+        stop_price=97.0,
+        # A target the ledger believes in but the broker never confirmed.
+        take_profit_order_id="t-ghost",
+        take_profit_price=110.0,
+    )
+    real = client.submit_order
+    seen: list[str] = []
+
+    async def fail_the_group_only(request):
+        # Only the OCO is refused; the rollback stop has to go through.
+        seen.append(str(getattr(request, "order_class", "")))
+        if len(seen) == 1:
+            raise RuntimeError("the broker said no")
+        return await real(request)
+
+    monkeypatch.setattr(client, "submit_order", fail_the_group_only)
+
+    with pytest.raises(RuntimeError):
+        await manager.ensure_take_profit(
+            environment=PAPER,
+            position=make_position(symbol="AAPL", entry=100.0, current=102.0),
+            target_price=110.0,
+        )
+
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "AAPL")
+    assert len(seen) == 2, "the group was tried once and the stop went back"
+    assert row.stop_order_id not in (None, "s1")
+    assert row.stop_price == 97.0
+    # Nothing is protecting the upside now, so the ledger must stop saying so.
+    assert row.take_profit_order_id is None

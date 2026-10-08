@@ -478,6 +478,70 @@ class PositionProtectionManager:
 
     # ------------------------------------------------------------- protection
 
+    async def _restore_stop(
+        self,
+        environment: TradingEnvironment,
+        position: object,
+        stop_price: float,
+    ) -> None:
+        """Put a bare stop back after an upgrade to an OCO group failed.
+
+        Releasing the stop to make room for the group is the only way Alpaca
+        will accept it, so it has a rollback. Best effort by design: the caller
+        is already on its way to raising, and letting this one escape would
+        bury the original failure. What it must never do is stay silent, so
+        every outcome here is logged.
+        """
+        try:
+            await self._await_shares_free(environment, position.symbol)
+            result = await self._submit_exit(
+                environment=environment,
+                request=OrderBuilder.build_protective_stop(
+                    symbol=position.symbol,
+                    qty=abs(position.qty),
+                    exit_side=position.direction,
+                    stop_price=stop_price,
+                ),
+                symbol=position.symbol,
+            )
+        except Exception as exc:  # noqa: BLE001 - already failing; do not mask the cause
+            log.error(
+                "protection.stop_restore_failed",
+                environment=environment.value,
+                symbol=position.symbol,
+                stop=stop_price,
+                error=str(exc),
+            )
+            return
+        if result.order is None or not result.order.id:
+            log.error(
+                "protection.stop_restore_unconfirmed",
+                environment=environment.value,
+                symbol=position.symbol,
+                stop=stop_price,
+            )
+            return
+        await self._persist(
+            environment,
+            position.symbol,
+            qty=abs(position.qty),
+            entry_price=position.avg_entry_price,
+            stop_order_id=result.order.id,
+            stop_price=stop_price,
+            # The group never landed, so nothing is protecting the upside now.
+            # Clearing the stale ids keeps the ledger from advertising a target
+            # and an OCO that do not exist at the broker.
+            take_profit_order_id=None,
+            order_class=None,
+        )
+        log.warning(
+            "protection.stop_restored",
+            environment=environment.value,
+            symbol=position.symbol,
+            stop=stop_price,
+            order=result.order.id,
+        )
+
     async def _merge_into_oco(
         self,
         environment: TradingEnvironment,
@@ -486,6 +550,7 @@ class PositionProtectionManager:
         *,
         stop_price: float | None = None,
         target_price: float | None = None,
+        replace_stop_id: str | None = None,
     ) -> ProtectionState | None:
         """Fold a standalone take-profit and the stop into one OCO group.
 
@@ -497,6 +562,12 @@ class PositionProtectionManager:
 
         ``target_price`` lets a caller restore a level the ledger still knows
         but the live state no longer carries.
+
+        ``replace_stop_id`` names a live standalone stop that has to be
+        released first. Alpaca counts the shares of a stop as held, so a group
+        that also wants them is rejected outright. That release is the only way
+        through, which is why it is undone the moment the group does not land:
+        a position must never stay naked because an upgrade was attempted.
         """
         target = target_price if target_price is not None else state.take_profit_price
         stop = stop_price if stop_price is not None else state.stop_price
@@ -528,14 +599,46 @@ class PositionProtectionManager:
                     error=str(exc),
                 )
                 return None
-        await self._await_shares_free(
-            environment, position.symbol, ignore=state.inert_order_ids
-        )
-        result = await self._submit_exit(
-            environment=environment, request=request, symbol=position.symbol
-        )
+
+        # Same for a standalone stop. Cancelled only here, immediately before
+        # the group is attempted, and restored on any failure below.
+        released_stop_id = replace_stop_id
+        if released_stop_id:
+            try:
+                await self._engine.cancel_order(released_stop_id, environment=environment)
+            except (BotalpacaError, BrokerError, RuntimeError) as exc:
+                log.warning(
+                    "protection.stop_release_failed",
+                    environment=environment.value,
+                    symbol=position.symbol,
+                    stop=stop,
+                    error=str(exc),
+                )
+                return None
+
+        try:
+            await self._await_shares_free(
+                environment, position.symbol, ignore=state.inert_order_ids
+            )
+            result = await self._submit_exit(
+                environment=environment, request=request, symbol=position.symbol
+            )
+        except Exception as exc:  # noqa: BLE001 - re-raised after the rollback below
+            log.warning(
+                "protection.oco_failed",
+                environment=environment.value,
+                symbol=position.symbol,
+                stop=stop,
+                take_profit=target,
+                error=str(exc),
+            )
+            if released_stop_id:
+                await self._restore_stop(environment, position, stop)
+            raise
         if result.order is None or not result.order.id:
             log.warning("protection.oco_unconfirmed", symbol=position.symbol)
+            if released_stop_id:
+                await self._restore_stop(environment, position, stop)
             return None
         stop_id = result.order.id
         for leg in result.order.legs or ():
@@ -708,7 +811,14 @@ class PositionProtectionManager:
         # top of a live stop has to travel with it inside one OCO group.
         if state.has_stop:
             merged = await self._merge_into_oco(
-                environment, position, state, target_price=target_price
+                environment,
+                position,
+                state,
+                target_price=target_price,
+                # The live stop holds every share, so Alpaca would refuse the
+                # group. Naming it here lets the merge release and, if anything
+                # goes wrong, put it straight back.
+                replace_stop_id=state.stop_order_id,
             )
             if merged is not None and merged.has_take_profit:
                 return merged
