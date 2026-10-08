@@ -255,7 +255,13 @@ class MarketDataService:
         request = StockBarsRequest(
             symbol_or_symbols=symbol.upper(),
             timeframe=TimeFrame(tf.amount, tf.unit),
-            limit=limit,
+            # No ``limit`` here on purpose. When a request carries both ``start``
+            # and ``limit``, Alpaca returns the OLDEST ``limit`` bars of the
+            # window, not the most recent ones. Since the window is deliberately
+            # wider than the count (see ``_default_start``), that silently cut
+            # the history short in the past: AAPL daily bars ended on 2025-11-28
+            # while the market was at 337. The window is what makes the request
+            # work; the trim below is what decides which end we keep.
             start=start if start is not None else _default_start(tf.minutes, limit),
             end=end,
             adjustment=adjustment,
@@ -265,7 +271,7 @@ class MarketDataService:
         payload = await self._run(client.get_stock_bars, request)
         bars = [to_bar(b) for b in payload[symbol.upper()]]
         bars.sort(key=lambda b: b.timestamp)
-        return bars
+        return bars[-limit:]
 
     async def get_bars_multi(
         self, symbols: Sequence[str], timeframe: str = "1D", *, limit: int = 300
@@ -278,7 +284,9 @@ class MarketDataService:
         request = StockBarsRequest(
             symbol_or_symbols=upper,
             timeframe=TimeFrame(tf.amount, tf.unit),
-            limit=limit,
+            # See ``get_bars``: with both ``start`` and ``limit`` Alpaca keeps the
+            # oldest bars of the window, which is the opposite of what a scanner
+            # wants. The window is the request; the trim picks the recent end.
             start=_default_start(tf.minutes, limit),
             adjustment=Adjustment.SPLIT,
             feed=self.feed,
@@ -288,7 +296,7 @@ class MarketDataService:
         result: dict[str, list[Bar]] = {}
         for symbol, raw_bars in payload.items():
             bars = sorted((to_bar(b) for b in raw_bars), key=lambda b: b.timestamp)
-            result[symbol.upper()] = bars
+            result[symbol.upper()] = bars[-limit:]
         return result
 
     async def get_quote(self, symbol: str) -> Quote | None:
