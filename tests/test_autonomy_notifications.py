@@ -145,6 +145,105 @@ async def test_an_autonomous_card_reaches_the_notification_service():
     assert keyboards == [None]
 
 
+async def test_an_armed_trailing_stop_reaches_the_notification_service():
+    """Arming the trailing stop is the last thing the engine does on a winner.
+
+    It rides on the very same delivery line as the break-even above, but the
+    conditions are different: the trade must already be sitting at break-even,
+    past the ratcheting window, and still short of the trailing trigger.
+    """
+    sent: list[str] = []
+    keyboards: list[object] = []
+
+    class _Notifications:
+        async def send(self, text, keyboard=None, *, force=False):
+            sent.append(text)
+            keyboards.append(keyboard)
+            return True
+
+    class _App:
+        active_environment = _PAPER
+        notifications = _Notifications()
+        _alert_handler = None
+
+        async def notify_position_alert(self, alert):
+            if self._alert_handler is None:
+                return None
+            await self._alert_handler(alert)
+            return None
+
+    app = _App()
+    facade = _make_facade(app)
+    app._alert_handler = lambda card: facade.handle_alert(card)
+    protection = _Protection()
+    # Already at break-even (stop above entry) so step 4 stands aside.
+    # initial_stop_price=97.0 and current=107.0 give R=7/3, past the 2.0
+    # trailing trigger and clear of the progressive band.
+    protection._state = _make_state(
+        break_even_active=True, stop_price=100.5
+    )
+
+    protector = AutonomousProtector(
+        protection,
+        environment=_PAPER,
+        notify=facade.app.notify_position_alert,
+    )
+    reports = await protector.evaluate(_position(107.0))
+
+    assert [r.action for r in reports] == [AutonomyAction.TRAILING]
+    assert sent, "the trailing stop was armed but nothing was delivered"
+    assert "trailing" in sent[0].lower()
+    assert keyboards == [None]
+
+
+async def test_the_progressive_window_is_not_empty():
+    """The ratchet must have a band to fire in.
+
+    With break-even at 1.0R and trailing at 1.5R the condition was
+    ``r_now <= 1.5 and r_now > 1.5`` -- the empty set, so the progressive
+    step could never fire. Trailing now triggers at 2.0R, leaving (1.5, 2.0].
+    """
+    sent: list[str] = []
+
+    class _Notifications:
+        async def send(self, text, keyboard=None, *, force=False):
+            sent.append(text)
+            return True
+
+    class _App:
+        active_environment = _PAPER
+        notifications = _Notifications()
+        _alert_handler = None
+
+        async def notify_position_alert(self, alert):
+            if self._alert_handler is None:
+                return None
+            await self._alert_handler(alert)
+            return None
+
+    app = _App()
+    facade = _make_facade(app)
+    app._alert_handler = lambda card: facade.handle_alert(card)
+    protection = _Protection()
+    # Already at break-even (stop above entry) so step 4 stands aside.
+    # initial_stop_price=97.0 and current=105.25 give R = 5.25/3 = 1.75,
+    # inside the (1.5, 2.0] band.
+    protection._state = _make_state(
+        break_even_active=True, stop_price=100.5
+    )
+
+    protector = AutonomousProtector(
+        protection,
+        environment=_PAPER,
+        notify=facade.app.notify_position_alert,
+    )
+    reports = await protector.evaluate(_position(105.25))
+
+    assert [r.action for r in reports] == [AutonomyAction.PROGRESSIVE]
+    assert sent, "the progressive step applied but nothing was delivered"
+    assert "proteccion progresiva" in sent[0].lower()
+
+
 async def test_a_string_payload_is_sent_as_it_stands():
     sent: list[str] = []
 
@@ -243,16 +342,18 @@ from botalpaca.domain.enums import TradingEnvironment  # noqa: E402
 _PAPER = TradingEnvironment.PAPER
 
 
-def _make_state():
+def _make_state(**kw):
     from botalpaca.domain.models import ProtectionState
 
-    return ProtectionState(
+    base = dict(
         symbol="AAPL",
         environment=_PAPER,
         has_stop=True,
         stop_price=97.0,
         initial_stop_price=97.0,
     )
+    base.update(kw)
+    return ProtectionState(**base)
 
 
 def _make_facade(app):

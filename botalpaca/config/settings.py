@@ -180,8 +180,18 @@ class ProtectionSettings(BaseSettings):
     auto_trailing: bool = True
     """Arm a trailing stop once the trade passes `trailing_trigger_r`."""
 
-    trailing_trigger_r: float = Field(default=1.5, gt=0)
-    """R multiple at which the trailing stop takes over from the fixed stop."""
+    trailing_trigger_r: float = Field(default=2.0, gt=0)
+    """R multiple at which the trailing stop takes over from the fixed stop.
+
+    This has to stay clear of ``break_even_trigger_r + 0.5``: the progressive
+    step lives in the band between the two, and with 1.0 and 1.5 that band was
+    empty, so the ratchet could never fire. At 2.0 the band is (1.5, 2.0].
+
+    A later trigger also keeps the trail further from the price, which is what
+    the broker asks for: Alpaca rejects a trail wider than 25% of the price and
+    warns that a trail tighter than the ordinary noise gets stopped out. At
+    2.5 ATR the trail sits near 5% of the price, well inside the limit.
+    """
 
     auto_time_stop: bool = True
     """Close a position whose `default_time_stop_minutes` has expired."""
