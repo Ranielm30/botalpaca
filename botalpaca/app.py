@@ -882,8 +882,21 @@ class Application:
         if opened_at is not None and opened_at.tzinfo is None:
             opened_at = opened_at.replace(tzinfo=dt.UTC)
 
-        fills: list[_ExitFill] = []
+        # A bracket reports its exits as legs of the entry order, not as
+        # top-level orders. The entry itself carries the entry's own side, so
+        # reading only the top level finds nothing to settle.
+        seen: set[str] = set()
+        candidates: list[object] = []
         for order in orders:
+            for candidate in (order, *(getattr(order, "legs", None) or [])):
+                key = str(candidate.id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(candidate)
+
+        fills: list[_ExitFill] = []
+        for order in candidates:
             if str(getattr(order.side, "value", order.side)).lower() != want_side:
                 continue
             if str(getattr(order.status, "value", order.status)).lower() != "filled":

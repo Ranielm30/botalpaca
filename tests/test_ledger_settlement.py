@@ -36,6 +36,7 @@ def _order(
     price: float | None = 98.0,
     qty: float = 10.0,
     filled_at: dt.datetime | None = None,
+    legs=None,
 ):
     """One Alpaca order, shaped like the entity the trading client returns."""
     return SimpleNamespace(
@@ -43,6 +44,7 @@ def _order(
         side=SimpleNamespace(value=side),
         status=SimpleNamespace(value=status),
         type=SimpleNamespace(value=order_type),
+        legs=legs,
         filled_at=filled_at,
         filled_avg_price=price,
         filled_qty=qty,
@@ -320,6 +322,50 @@ async def test_a_live_position_is_left_alone(database):
     row = await _row(database, trade.id)
     assert row.status == "OPEN"
     assert row.closed_at is None
+
+
+async def test_a_bracket_exit_is_found_among_the_legs(database):
+    """Alpaca reports a bracket's exits as legs of the entry order."""
+    when = dt.datetime.now(UTC) + dt.timedelta(seconds=5)
+    tp_leg = _order("tp-leg", side="sell", status="filled", order_type="limit",
+                    price=104.0, filled_at=when)
+    sl_leg = _order("sl-leg", side="sell", status="canceled", order_type="stop",
+                    price=None, filled_at=None)
+    # The entry is the parent: filled, but on the side that opened the trade.
+    entry = _order("entry-1", side="buy", status="filled", order_type="market",
+                   price=100.0, filled_at=when - dt.timedelta(seconds=5),
+                   legs=[tp_leg, sl_leg])
+    row = await _open(
+        TradeJournal(database), stop_order_id="sl-leg", take_profit_order_id="tp-leg"
+    )
+    app = _App(database, orders=[entry])
+
+    await _settle(app, [])
+
+    row = await _row(database, row.id)
+    assert row.status == "CLOSED"
+    assert row.exit_reason == "TARGET"
+    assert row.exit_price == pytest.approx(104.0)
+    assert row.pnl == pytest.approx(40.0)
+
+
+async def test_the_same_leg_is_not_counted_twice(database):
+    when = dt.datetime.now(UTC) + dt.timedelta(seconds=5)
+    tp_leg = _order("tp-leg", side="sell", status="filled", order_type="limit",
+                    price=104.0, filled_at=when)
+    entry = _order("entry-1", side="buy", status="filled", order_type="market",
+                   price=100.0, filled_at=when, legs=[tp_leg])
+    # The same fill also shows up on its own at the top level.
+    row = await _open(
+        TradeJournal(database), stop_order_id="sl-x", take_profit_order_id="tp-leg"
+    )
+    app = _App(database, orders=[entry, tp_leg])
+
+    await _settle(app, [])
+
+    row = await _row(database, row.id)
+    assert row.exit_price == pytest.approx(104.0)
+    assert row.pnl == pytest.approx(40.0)
 
 
 async def test_a_trade_in_another_environment_is_untouched(database):
