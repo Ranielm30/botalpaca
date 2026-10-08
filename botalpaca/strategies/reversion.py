@@ -104,6 +104,12 @@ class SupportResistanceBounceStrategy(BaseStrategy):
     display_name = "Soporte/Resistencia"
     min_touches = 2
     proximity_atr = 0.6
+    # The trigger. Being near a level is a zone, not a signal: price can sit
+    # under a support all session and keep falling through it. A bounce needs
+    # the tape to have pushed below the level and been rejected, which leaves
+    # a wick. Half an ATR is roughly a routine intraday poke -- below that,
+    # the move was noise and there is nothing to confirm.
+    min_rejection_atr = 0.5
 
     def detect(self, snapshot: TechnicalSnapshot) -> StrategySignal | None:
         i = snapshot.indicators
@@ -113,8 +119,13 @@ class SupportResistanceBounceStrategy(BaseStrategy):
         supports = [s for s in snapshot.structure.supports if s.touches >= self.min_touches]
         resistances = [r for r in snapshot.structure.resistances if r.touches >= self.min_touches]
 
+        # No rejection on either side means no bounce, whatever the price is
+        # sitting next to.
+        rejected_up = (i.bull_rejection_atr or 0.0) >= self.min_rejection_atr
+        rejected_down = (i.bear_rejection_atr or 0.0) >= self.min_rejection_atr
+
         signal: StrategySignal | None = None
-        if supports and (i.close - supports[0].price) <= self.proximity_atr * atr:
+        if supports and rejected_up and (i.close - supports[0].price) <= self.proximity_atr * atr:
             level = supports[0]
             levels = levels_from_atr(
                 SignalDirection.LONG, i.close, atr,
@@ -128,12 +139,13 @@ class SupportResistanceBounceStrategy(BaseStrategy):
                 reasons=[
                     f"soporte probado ${level.price:,.2f} ({level.touches} toques)",
                     f"precio a {abs(i.close - level.price):.2%} del nivel",
+                    f"mecha de rechazo de {i.bull_rejection_atr:.2f} ATR bajo el mínimo",
                 ],
                 confluences=["nivel de soporte", "rechazo de precio"],
                 invalidation=f"cierre bajo ${level.price:,.2f}",
                 extra={"level_price": level.price, "touches": level.touches},
             )
-        elif resistances and (resistances[0].price - i.close) <= self.proximity_atr * atr:
+        elif resistances and rejected_down and (resistances[0].price - i.close) <= self.proximity_atr * atr:
             level = resistances[0]
             levels = levels_from_atr(
                 SignalDirection.SHORT, i.close, atr,
@@ -147,6 +159,7 @@ class SupportResistanceBounceStrategy(BaseStrategy):
                 reasons=[
                     f"resistencia probada ${level.price:,.2f} ({level.touches} toques)",
                     f"precio a {abs(i.close - level.price):.2%} del nivel",
+                    f"mecha de rechazo de {i.bear_rejection_atr:.2f} ATR sobre el máximo",
                 ],
                 confluences=["nivel de resistencia", "rechazo de precio"],
                 invalidation=f"cierre sobre ${level.price:,.2f}",

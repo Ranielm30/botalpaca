@@ -59,7 +59,7 @@ QUALITY_THRESHOLDS: tuple[tuple[float, Quality], ...] = (
 # the operator can loosen it without a code change: at 70 nothing qualified, and
 # a bot that never opens a position cannot be evaluated at all.
 MIN_EXECUTABLE_SCORE = 60.0
-MIN_RR = 1.5
+MIN_RR = 2.0
 MIN_DATA_QUALITY = 0.5
 
 
@@ -356,6 +356,57 @@ class ConfluenceEngine:
             return bool(self.risk.allow_shorts_in_real)
         return bool(self.risk.allow_shorts)
 
+    def _blocking_obstacle(
+        self, opp: Opportunity, snapshot: TechnicalSnapshot
+    ) -> str | None:
+        """A well-tested level the trade has to break before it can reach the target.
+
+        This is the one thing a score must never be allowed to buy its way
+        past. A long whose target sits above a resistance is not a 2:1 setup,
+        it is a bet that the resistance gives way; if it does not, the target
+        was never reachable and the R that got approved was fictional.
+
+        Only levels tested at least ``min_blocking_level_touches`` times count.
+        A single touch is noise, and refusing those would empty the scanner.
+        """
+        structure = getattr(snapshot, "structure", None)
+        if structure is None:
+            return None
+        minimum_touches = int(getattr(self.risk, "min_blocking_level_touches", 2) or 0)
+        if minimum_touches < 1:
+            return None
+
+        if opp.direction is SignalDirection.LONG:
+            entry, target = opp.entry, opp.target
+            if target <= entry:
+                return None
+            candidates = [
+                lvl
+                for lvl in structure.resistances
+                if entry < lvl.price < target and lvl.touches >= minimum_touches
+            ]
+            side = "resistencia"
+        else:
+            entry, target = opp.entry, opp.target
+            if target >= entry:
+                return None
+            candidates = [
+                lvl
+                for lvl in structure.supports
+                if target < lvl.price < entry and lvl.touches >= minimum_touches
+            ]
+            side = "soporte"
+
+        if not candidates:
+            return None
+        nearest = min(candidates, key=lambda lvl: abs(lvl.price - entry))
+        distance_pct = abs(nearest.price - entry) / max(abs(entry), 1e-9) * 100.0
+        return (
+            f"{side} en {nearest.price:.2f} ({nearest.touches} toques, "
+            f"a {distance_pct:.2f}% de la entrada) entre la entrada y el "
+            f"objetivo {target:.2f}: el objetivo exige romperla antes"
+        )
+
     def _apply_tradability(
         self,
         opp: Opportunity,
@@ -391,6 +442,12 @@ class ConfluenceEngine:
                 blocks.append(f"score {opp.score:.0f} demasiado bajo")
         if opp.atr is None or opp.atr <= 0:
             blocks.append("ATR no disponible para dimensionar el stop")
+        # Structure is a veto, not a score component. Nothing above can buy
+        # its way past a level that has to be broken before the target is
+        # reachable: the R that was approved simply would not exist.
+        obstacle = self._blocking_obstacle(opp, snapshot)
+        if obstacle is not None:
+            blocks.append(obstacle)
         # A long bought at RSI 85 is not a trend entry, it is the end of one.
         # LLY was taken twice this way (RSI 85 and 87) and both trades were
         # immediately underwater. The score never punished it: a strong trend

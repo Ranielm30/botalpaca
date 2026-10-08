@@ -110,7 +110,10 @@ async def test_a_moved_price_is_refused():
 
 
 async def test_the_drift_cap_is_configurable():
-    app = _App(100.6, _risk(max_entry_drift_pct=1.0))
+    # This case is about the cap, and the plan's ratio is exactly 2.0, so the
+    # 0.6% move drags it under the minimum and the ratio guard would answer
+    # first. The floor stands aside so the cap is the one being measured.
+    app = _App(100.6, _risk(max_entry_drift_pct=1.0, min_rr_at_entry=0.0))
     # 0.6% is inside a 1% cap.
     assert await _check(app, _plan(entry=100.0)) is None
 

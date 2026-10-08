@@ -138,10 +138,12 @@ def test_confluence_refines_levels_onto_real_structure():
     snap = make_snapshot()
     signal = _signal(entry=100.0, stop=96.0, target=112.0)
     opp = _engine().score(snap, signal, environment=TradingEnvironment.PAPER)
-    assert opp.stop == pytest.approx(96.0)
+    # The nearest support is 96 and the noise buffer is half an ATR, so the
+    # stop sits 1.25 below it. The only resistance on the chart is 4 points
+    # away, which does not pay for 5.25 of risk at 2:1, so it is used anyway.
+    assert opp.stop == pytest.approx(94.75)
     assert opp.target == pytest.approx(104.0)
-    # 4 points of risk against 4 of reward, measured from the chart.
-    assert opp.rr == pytest.approx(1.0)
+    assert opp.rr == pytest.approx((opp.target - 100.0) / (100.0 - opp.stop), abs=0.005)
     assert opp.rr != 1.5
 
 
@@ -156,11 +158,11 @@ def test_confluence_tradable_requires_score_gate():
     snap = make_snapshot()
     signal = _signal(entry=100.0, stop=97.0, target=106.0)
     opp = _engine().score(snap, signal, environment=TradingEnvironment.PAPER)
-    # The snapshot's support is 96 and its resistance 104, so the structural
-    # trade is 4 points of risk against 4 of reward.
-    assert opp.stop == pytest.approx(96.0)
+    # The snapshot's support is 96 and its resistance 104; with half an ATR of
+    # buffer the risk becomes 5.25 against 4 of reward, which no longer clears.
+    assert opp.stop == pytest.approx(94.75)
     assert opp.target == pytest.approx(104.0)
-    assert opp.rr == pytest.approx(1.0)
+    assert opp.rr == pytest.approx((opp.target - 100.0) / (100.0 - opp.stop), abs=0.005)
     # Below MIN_RR on real levels, so the setup is genuinely vetoed. Before the
     # refinement this same setup reported 1.50 and sailed through.
     assert opp.rr < MIN_RR

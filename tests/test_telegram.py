@@ -163,9 +163,12 @@ class _Portfolio:
 
 
 class _Risk:
-    def __init__(self) -> None:
+    def __init__(self, settings: RiskSettings | None = None) -> None:
         self.approved = True
         self.calls = 0
+        # A typed quantity is measured against the same caps the engine uses
+        # for its own sizing, so the stub has to expose them.
+        self.settings = settings or RiskSettings()
 
     async def assess(self, opportunity, context) -> RiskAssessment:
         self.calls += 1
@@ -705,6 +708,71 @@ async def test_comprar_refuses_when_risk_rejects():
     result = await facade.comprar(_update(), "AAPL")
     assert "no permit" in result.text.lower()
     assert await app.confirmations.peek(USER) is None
+
+
+# --------------------------------------------------------------------------------------
+# a typed quantity is bounded by the same limits the engine sizes with
+# --------------------------------------------------------------------------------------
+async def test_a_quantity_that_risks_more_than_the_cap_is_refused():
+    """The override used to report the risk and never compare it to anything."""
+    app = FakeApp(PAPER)
+    app.active.risk.settings = RiskSettings(
+        max_risk_per_trade_pct=0.1, max_order_notional=10_000_000.0
+    )
+    facade = TelegramFacade(app)
+    result = await facade.comprar(_update(), "AAPL 9000")
+    assert "no permit" in result.text.lower()
+    assert "máximo" in result.text
+    assert await app.confirmations.peek(USER) is None
+
+
+async def test_a_quantity_with_an_oversized_notional_is_refused():
+    app = FakeApp(PAPER)
+    app.active.risk.settings = RiskSettings(
+        max_risk_per_trade_pct=100.0, max_order_notional=10.0
+    )
+    facade = TelegramFacade(app)
+    result = await facade.comprar(_update(), "AAPL 50")
+    assert "no permit" in result.text.lower()
+    assert "nocional" in result.text
+    assert await app.confirmations.peek(USER) is None
+
+
+async def test_the_refusal_names_the_largest_quantity_that_would_fit():
+    app = FakeApp(PAPER)
+    app.active.risk.settings = RiskSettings(
+        max_risk_per_trade_pct=0.1, max_order_notional=10_000_000.0
+    )
+    facade = TelegramFacade(app)
+    result = await facade.comprar(_update(), "AAPL 9000")
+    assert "usar como mucho" in result.text
+
+
+async def test_a_modest_quantity_still_goes_through():
+    """The limits are a ceiling, not a new reason to find nothing."""
+    app = FakeApp(PAPER)
+    app.active.risk.settings = RiskSettings(
+        max_risk_per_trade_pct=100.0, max_order_notional=10_000_000.0
+    )
+    facade = TelegramFacade(app)
+    await facade.comprar(_update(), "AAPL 3")
+    pending = await app.confirmations.peek(USER)
+    assert pending is not None
+    assert pending.details["plan"]["qty"] == 3.0
+
+
+async def test_the_staged_plan_carries_the_assessment_that_was_shown():
+    """It used to be dropped, so confirm_trade read back {"approved": True}."""
+    app = FakeApp(PAPER)
+    facade = TelegramFacade(app)
+    await facade.comprar(_update(), "AAPL")
+    pending = await app.confirmations.peek(USER)
+    assert pending is not None
+    assessment = pending.details.get("assessment")
+    assert assessment is not None, "the risk verdict must survive staging"
+    assert assessment["approved"] is True
+    assert assessment["risk_per_trade_pct"] == 1.0
+    assert assessment["max_risk_amount"] == 1_000.0
 
 
 # --------------------------------------------------------------------------------------

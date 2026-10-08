@@ -240,8 +240,22 @@ class PositionProtectionManager:
                 OrderClass.OCO,
             ):
                 state.order_class = order.order_class
-        if state.has_stop and state.has_take_profit and state.order_class is None:
-            state.order_class = OrderClass.OCO
+        if state.order_class is None and state.has_stop and state.has_take_profit:
+            # Only a group Alpaca actually reported counts. Inferring OCO from
+            # "there is a stop and there is a target" wrote an order class
+            # into the ledger that the broker never confirmed, and everything
+            # downstream that trusts it (break-even, the autonomy, the ledger)
+            # then reasons on a guess.
+            def _groups(order_id: str | None) -> set[str]:
+                if order_id is None:
+                    return set()
+                for candidate in mine:
+                    if candidate.id == order_id:
+                        return {str(g) for g in (getattr(candidate, "group_ids", None) or ())}
+                return set()
+
+            if _groups(state.stop_order_id) & _groups(state.take_profit_order_id):
+                state.order_class = OrderClass.OCO
         return state
 
     async def state_for_position(
@@ -760,6 +774,15 @@ class PositionProtectionManager:
             stop_order_id=result.order.id,
             stop_price=price,
         )
+        # Freeze the baseline here as well, not just on the way in. A position
+        # that reached this point without one is an orphan that had no stop in
+        # Alpaca when it was adopted, so ``_adopt_orphan`` had nothing to
+        # freeze and the R rules were left measuring against a stop that moves.
+        # record_initial_stop never rewrites, so this is safe to call every time.
+        async with self._db.session() as session:
+            await ProtectionRepository(session).record_initial_stop(
+                environment, position.symbol, price
+            )
         state.has_stop = True
         state.stop_order_id = result.order.id
         state.stop_price = price
@@ -1524,6 +1547,33 @@ class PositionProtectionManager:
                         log.error(
                             "protection.reconcile.target_failed", symbol=symbol, error=str(exc)
                         )
+            elif state.has_stop and state.order_class is None and auto:
+                # A stop and a target are both live and the broker reported no
+                # group: two independent exits standing on the same shares.
+                # Alpaca only lets one of them hold the position, so the other
+                # is dead weight that reads as a second exit. Folding them into
+                # one OCO is the only shape where both can actually fire, and
+                # _merge_into_oco puts the bare stop back if the group is
+                # refused.
+                try:
+                    merged = await self._merge_into_oco(
+                        environment=environment,
+                        position=position,
+                        state=state,
+                        stop_price=state.stop_price,
+                        target_price=state.take_profit_price,
+                        replace_stop_id=state.stop_order_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - reconciliation must not abort
+                    notes.append(f"⚠️ {symbol}: dos salidas sueltas sin poder agrupar — {readable_reason(exc)}")
+                    log.error(
+                        "protection.reconcile.group_failed", symbol=symbol, error=str(exc)
+                    )
+                else:
+                    if merged is None or not merged.has_take_profit:
+                        notes.append(f"⚠️ {symbol}: dos salidas sueltas y el broker no admite el grupo")
+                    else:
+                        notes.append(f"🔗 {symbol}: stop y objetivo reunidos en un solo grupo")
             if not state.has_stop:
                 if not auto:
                     notes.append(f"⚠️ {symbol}: posición abierta SIN stop en Alpaca")

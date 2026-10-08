@@ -92,6 +92,17 @@ def compute_indicators(
     if bb_u_val is not None and bb_l_val is not None and bb_m_val not in (None, 0):
         bb_width = (bb_u_val - bb_l_val) / bb_m_val
 
+    # The rejection wick of the last bar, in ATR units. ATR rather than the
+    # bar's own range, so "big enough to matter" means the same thing on a
+    # quiet tape and on a violent one.
+    bull_rej = bear_rej = None
+    if atr_val and atr_val > 0:
+        bull_frac, bear_frac = ind.rejection_wicks(
+            _col(bars, "open"), highs, lows, closes
+        )
+        bull_rej = bull_frac * float(highs[-1] - lows[-1]) / atr_val
+        bear_rej = bear_frac * float(highs[-1] - lows[-1]) / atr_val
+
     return IndicatorSet(
         timeframe=timeframe,
         close=close,
@@ -125,6 +136,8 @@ def compute_indicators(
         lowest_20=_last_finite(lowest20),
         highest_52w=_last_finite(highest52),
         lowest_52w=_last_finite(lowest52),
+        bull_rejection_atr=bull_rej,
+        bear_rejection_atr=bear_rej,
     )
 
 

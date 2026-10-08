@@ -112,13 +112,17 @@ class RiskSettings(BaseSettings):
     # at the live price before anything reaches Alpaca. LLY was approved at
     # 1.5 R:R on $1105.06 and filled at $1176.00: a real 0.08 with a target
     # 0.86% away.
-    min_rr_at_entry: float = Field(default=1.5)
+    min_rr_at_entry: float = Field(default=2.0)
     max_entry_drift_pct: float = Field(default=0.5)
     min_target_distance_atr: float = Field(default=1.0)
     min_target_distance_pct: float = Field(default=1.0)
     # A long bought at RSI 85 is not a trend entry, it is the end of one. LLY
     # was taken twice this way (RSI 85 and 87).
     max_rsi_for_long: float = Field(default=75.0)
+    # How many touches a level needs before it counts as an obstacle between
+    # the entry and the target. One touch is noise; refusing those would empty
+    # the scanner. Set to 0 to disable the veto entirely.
+    min_blocking_level_touches: int = Field(default=2)
 
     allow_shorts: bool = Field(default=True)
     allow_shorts_in_real: bool = Field(default=False)

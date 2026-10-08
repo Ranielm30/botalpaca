@@ -837,17 +837,39 @@ class TelegramFacade:
             stop_distance = abs(opportunity.entry - opportunity.stop)
             risk_amount = qty_override * stop_distance
             risk_pct = (risk_amount / context.equity * 100.0) if context.equity else 0.0
+            notional = qty_override * opportunity.entry
+            # A typed quantity used to inherit the verdict but never the
+            # limits: the risk percentage and the notional were computed,
+            # reported and then never compared against anything, so any size
+            # the user typed reached the broker. Size is the one input the
+            # limits exist to constrain, so the override is measured here
+            # against the same caps the engine applies to its own sizing.
+            blocks = list(assessment.blocks)
+            limits = self.app.active.risk.settings
+            reasons = list(assessment.reasons)
+            reasons.append(f"Cantidad indicada por el usuario: {qty_override:g}")
+            if risk_pct > limits.max_risk_per_trade_pct:
+                blocks.append(
+                    f"la cantidad indicada arriesga {risk_pct:.2f}% del capital, "
+                    f"por encima del máximo {limits.max_risk_per_trade_pct:.2f}% "
+                    f"(usar como mucho "
+                    f"{self._qty_within(limits.max_risk_per_trade_pct, context.equity, stop_distance):g})"
+                )
+            if notional > limits.max_order_notional:
+                blocks.append(
+                    f"la cantidad indicada suma {notional:,.2f} de nocional, por encima "
+                    f"del máximo {limits.max_order_notional:,.2f}"
+                )
             from botalpaca.domain import RiskAssessment
 
             assessment = RiskAssessment(
-                approved=assessment.approved and not assessment.blocks,
-                reasons=assessment.reasons
-                + [f"Cantidad indicada por el usuario: {qty_override:g}"],
-                blocks=list(assessment.blocks),
+                approved=assessment.approved and not blocks,
+                reasons=reasons,
+                blocks=blocks,
                 risk_per_trade_pct=risk_pct,
                 max_risk_amount=risk_amount,
                 suggested_qty=qty_override,
-                suggested_notional=qty_override * opportunity.entry,
+                suggested_notional=notional,
                 stop_distance_pct=abs(opportunity.entry - opportunity.stop)
                 / opportunity.entry
                 * 100.0,
@@ -884,6 +906,19 @@ class TelegramFacade:
         return CommandResult(body, keyboard)
 
     @staticmethod
+    def _qty_within(max_risk_pct: float, equity: float, stop_distance: float) -> float:
+        """The largest whole quantity that stays inside a risk percentage.
+
+        Floored, never rounded up: telling someone they may buy 1.4 shares
+        when only 1 is inside the limit is the kind of rounding that ends up
+        as an oversized position.
+        """
+        if equity <= 0 or stop_distance <= 0 or max_risk_pct <= 0:
+            return 0.0
+        budget = equity * (max_risk_pct / 100.0)
+        return float(int(budget // stop_distance))
+
+    @staticmethod
     def _pick(opportunities: list[Opportunity], direction: str) -> Opportunity | None:
         for opportunity in opportunities:
             if opportunity.direction.value == direction and opportunity.tradable:
@@ -904,6 +939,15 @@ class TelegramFacade:
             summary=f"{plan.direction.value} {plan.qty:g} {plan.symbol}",
             details={
                 "plan": plan.model_dump(mode="json"),
+                # The assessment is what the risk engine actually said at the
+                # moment the plan was shown. It used to be left behind here,
+                # so confirm_trade read back a hardcoded {"approved": True}
+                # and the execution path never saw the verdict, the risk
+                # amount or the blocks. Anything that gates on the assessment
+                # at submission time was gating on a stub.
+                "assessment": assessment.model_dump(mode="json")
+                if hasattr(assessment, "model_dump")
+                else dict(assessment or {}),
                 "fingerprint": opportunity.fingerprint if opportunity else None,
             },
         )

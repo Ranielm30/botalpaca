@@ -93,6 +93,13 @@ def levels_from_atr(
 # sit a little wider than an ATR multiple; without slack the refinement
 # would reject the very levels it exists to use.
 MAX_STRUCTURE_STOP_BUDGET = 2.0
+# Measured results (Cesar Alvarez, Better System Trader) put the profitable
+# range for an initial stop at 2-4 ATR, with 2.5-3 the usual pick. Past that,
+# the target has to travel far enough to stop filling often.
+MAX_STOP_ATR = 3.0
+# A stop placed exactly on a swing level gets taken out by the wick that
+# tests it. The level is the reference, not the trigger.
+STRUCTURE_STOP_BUFFER_ATR = 0.5
 
 
 def refine_levels_with_structure(
@@ -139,43 +146,64 @@ def refine_levels_with_structure(
     def _distance(price: float) -> float:
         return abs(price - levels.entry)
 
-    # -- stop: the level price must defend, with room for noise ---------------
+    # -- stop: just beyond the nearest level the price has to defend --------
     # The ATR stop sets the budget: how much risk the strategy was willing to
-    # take. The structure then decides how much room is actually needed, within
-    # a cap of twice that budget -- real levels routinely sit a little further
-    # out than an ATR multiple, and honouring that is the whole point, but an
-    # unbounded level would silently multiply the size of the trade.
+    # take. Structure decides how much room is actually needed, inside two
+    # limits. Beyond the strategy budget (times MAX_STRUCTURE_STOP_BUDGET),
+    # because an unbounded level would silently multiply the risk. And beyond
+    # MAX_STOP_ATR, because measured results put the good range for an initial
+    # stop at 2-4 ATR: wider stops need proportionally wider targets to keep
+    # the ratio, and targets that far out stop filling at all.
     #
-    # The deepest usable level wins. Taking the one nearest the entry instead
-    # would put the stop in front of the support, so it would fire before that
-    # support was ever tested.
+    # The NEAREST usable level wins, plus a noise buffer so the wick has to
+    # travel before the support is even tested. Taking the deepest level
+    # instead -- which is what this used to do -- widens the risk for no gain:
+    # the extra distance buys no information, it only makes the ratio harder
+    # to clear, and a wide stop is exactly what turned every setup into a
+    # rejection downstream.
     budget = _distance(levels.stop)
-    cap = budget * MAX_STRUCTURE_STOP_BUDGET
+    cap = min(budget * MAX_STRUCTURE_STOP_BUDGET, MAX_STOP_ATR * atr)
+    buffer_size = STRUCTURE_STOP_BUFFER_ATR * atr
     stop = levels.stop
-    usable = [
-        lvl
-        for lvl in defensive
-        if _beyond(lvl.price, levels.entry)
-        and _distance(lvl.price) >= min_stop_atr * atr
-        and _distance(lvl.price) <= cap
-    ]
+    usable = sorted(
+        (
+            lvl
+            for lvl in defensive
+            if _beyond(lvl.price, levels.entry)
+            and _distance(lvl.price) + buffer_size >= min_stop_atr * atr
+            and _distance(lvl.price) + buffer_size <= cap
+        ),
+        key=lambda lvl: _distance(lvl.price),
+    )
     if usable:
-        stop = max(usable, key=lambda lvl: _distance(lvl.price)).price
+        nearest = usable[0].price
+        # The stop has to sit on the far side of the level, never on it.
+        stop = nearest - buffer_size if long else nearest + buffer_size
 
-    # -- target: the nearest obstacle in the way -------------------------
-    # The nearest one, never the first that happens to clear ``min_rr``.
-    # Shopping outwards until the ratio looks good would turn this into a
-    # rubber stamp: every chart has some far resistance, so every setup would
-    # pass and the filter would stop filtering. If the next obstacle does not
-    # pay for the risk, the setup genuinely does not, and MIN_RR must be free
-    # to say so.
+    # -- target: the first obstacle that actually pays for the risk ---------
+    # Walking outwards until the ratio clears ``min_rr`` is what the docstring
+    # always promised. The previous code took the NEAREST obstacle instead,
+    # which minimised the reward while the stop was being widened -- the two
+    # choices together drove every ratio down and the filter rejected
+    # everything the scanner produced.
+    #
+    # If no obstacle on the chart clears the ratio, the setup genuinely does
+    # not pay for its risk and MIN_RR is free to say so. In that case the
+    # farthest real obstacle is used rather than a projection: it is price the
+    # market has actually defended, and a target nobody reached is not a
+    # target. Only with nothing at all on the chart is the risk projected.
+    risk = abs(stop - levels.entry)
     target = levels.primary_target
     reachable = sorted(
         (lvl for lvl in obstacle if not _beyond(lvl.price, levels.entry)),
         key=lambda lvl: _distance(lvl.price),
     )
     if reachable:
-        target = reachable[0].price
+        paying = [lvl for lvl in reachable if risk > 0 and _distance(lvl.price) >= risk * min_rr]
+        target = (paying[0] if paying else reachable[-1]).price
+    elif risk > 0:
+        projected = risk * min_rr
+        target = levels.entry + projected if long else levels.entry - projected
 
     if stop == levels.stop and target == levels.primary_target:
         return levels

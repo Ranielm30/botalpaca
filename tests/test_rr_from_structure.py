@@ -6,9 +6,16 @@ so ``(target - entry) / (entry - stop)`` collapses to
 symbol and every day. A risk filter built on that ratio could never reject
 anything, while looking exactly like a filter.
 
-``refine_levels_with_structure`` puts the levels on the chart instead: the stop
-just beyond a tested support, the target at the nearest resistance. The ratio
-then measures the setup.
+``refine_levels_with_structure`` puts the levels on the chart instead. The stop
+sits just beyond the nearest support the price has to defend, with a buffer of
+noise around it; the target walks outwards until it pays at least ``min_rr``
+for the risk taken. The ratio then measures the setup.
+
+Two rules the numbers behind this are worth repeating. Measured results put the
+profitable range for an initial stop at 2-4 ATR, so the stop is capped there:
+past it the target has to travel too far to fill. And a ratio of 2:1 needs a
+33% hit rate just to break even, which is the floor worth designing against --
+1.5:1 was labelled "marginal" at a 45% hit rate.
 """
 
 from __future__ import annotations
@@ -17,6 +24,8 @@ import pytest
 
 from botalpaca.domain.enums import SignalDirection
 from botalpaca.strategies.base import (
+    MAX_STOP_ATR,
+    STRUCTURE_STOP_BUFFER_ATR,
     TradeLevels,
     levels_from_atr,
     refine_levels_with_structure,
@@ -24,7 +33,7 @@ from botalpaca.strategies.base import (
 
 LONG = SignalDirection.LONG
 SHORT = SignalDirection.SHORT
-MIN_RR = 1.5
+MIN_RR = 2.0
 
 
 class _Level:
@@ -60,52 +69,87 @@ def test_the_atr_ratio_ignores_the_market_entirely():
     cheap = _atr_levels(atr=0.5)
     expensive = _atr_levels(atr=25.0)
     assert cheap.rr == expensive.rr
-    # The risk is wildly different, yet the ratio is identical.
     assert cheap.risk_per_share != expensive.risk_per_share
 
 
-# -- the refinement reads the chart --------------------------------------------------
-def test_the_stop_goes_just_beyond_a_tested_support():
+# -- the stop: nearest support, plus room for the wick -------------------------------
+def test_the_stop_sits_beyond_the_nearest_support_with_a_noise_buffer():
     levels = _atr_levels()
     refined = refine_levels_with_structure(
         levels, _Structure(supports=[(96.0, 2)]), 2.0, min_rr=MIN_RR
     )
-    assert refined.stop == pytest.approx(96.0)
-    # Beyond the level, so it only fires when the support actually fails.
-    assert refined.stop < 96.0 + 1e-9
+    # ATR is 2.0, so the buffer is half of it: the stop goes below the level,
+    # not on it, so the wick has to travel before the support is even tested.
+    assert refined.stop == pytest.approx(96.0 - STRUCTURE_STOP_BUFFER_ATR * 2.0)
+    assert refined.stop < 96.0
 
 
-def test_the_target_goes_to_the_nearest_resistance():
+def test_the_nearest_support_wins_not_the_deepest():
+    """Widening the risk buys no information and only makes the ratio harder."""
+    levels = _atr_levels()
+    refined = refine_levels_with_structure(
+        levels, _Structure(supports=[(96.0, 3), (98.0, 1)]), 2.0, min_rr=MIN_RR
+    )
+    assert refined.stop == pytest.approx(98.0 - STRUCTURE_STOP_BUFFER_ATR * 2.0)
+
+
+def test_the_buffer_is_what_protects_from_the_noise():
+    """A level sitting right under the entry is still usable: the buffer is
+    the protection now, not the distance of the level itself."""
+    levels = _atr_levels()
+    refined = refine_levels_with_structure(
+        levels, _Structure(supports=[(99.8, 3)]), 2.0, min_rr=MIN_RR
+    )
+    assert refined.stop == pytest.approx(99.8 - STRUCTURE_STOP_BUFFER_ATR * 2.0)
+
+
+def test_the_stop_never_reaches_past_the_measured_band():
+    """Past 2-4 ATR the target has to travel far enough to stop filling."""
+    levels = _atr_levels()
+    refined = refine_levels_with_structure(
+        levels, _Structure(supports=[(50.0, 5)]), 2.0, min_rr=MIN_RR
+    )
+    assert levels.entry - refined.stop <= MAX_STOP_ATR * 2.0 + 1e-9
+
+
+# -- the target: it has to pay for the risk -------------------------------------------
+def test_the_target_walks_outwards_until_the_ratio_clears():
     levels = _atr_levels()
     refined = refine_levels_with_structure(
         levels, _Structure(resistances=[(104.0, 2), (120.0, 2)]), 2.0, min_rr=MIN_RR
     )
+    # 104 is only 4 away against 4 of risk: that is 1.0, not enough. 120 pays.
+    assert refined.primary_target == pytest.approx(120.0)
+    assert refined.rr >= MIN_RR
+
+
+def test_the_nearest_resistance_is_used_when_nothing_on_the_chart_pays():
+    levels = _atr_levels()
+    refined = refine_levels_with_structure(
+        levels, _Structure(resistances=[(104.0, 2)]), 2.0, min_rr=MIN_RR
+    )
+    # Real structure the market has defended beats a projection nobody reaches.
     assert refined.primary_target == pytest.approx(104.0)
+    assert refined.rr < MIN_RR
 
 
-def test_a_well_tested_level_is_preferred_over_a_bare_one():
+def test_a_bare_chart_projects_the_target_the_risk_demands():
+    levels = _atr_levels()
+    refined = refine_levels_with_structure(levels, _Structure(), 2.0, min_rr=MIN_RR)
+    assert refined.rr >= MIN_RR
+
+
+def test_the_rr_gate_can_still_reject_a_setup():
+    """If the next obstacle does not pay, the setup genuinely does not."""
     levels = _atr_levels()
     refined = refine_levels_with_structure(
-        levels,
-        _Structure(supports=[(99.0, 1), (96.0, 3)]),
-        2.0,
-        min_rr=MIN_RR,
+        levels, _Structure(supports=[(96.0, 2)], resistances=[(100.5, 2)]),
+        2.0, min_rr=MIN_RR,
     )
-    # 99 was touched once; 96 has been tested three times and is the real floor.
-    assert refined.stop == pytest.approx(96.0)
+    assert refined.rr < MIN_RR
 
 
-def test_a_support_inside_the_noise_band_is_ignored():
-    """A stop 0.1 ATR away gets taken out on an ordinary day."""
-    levels = _atr_levels()
-    refined = refine_levels_with_structure(
-        levels, _Structure(supports=[(99.8, 3)]), 2.0, min_rr=MIN_RR, min_stop_atr=0.5
-    )
-    assert refined.stop == pytest.approx(levels.stop)
-
-
-# -- the filter can finally reject ----------------------------------------------------
-def test_the_ratio_now_varies_between_setups():
+def test_the_ratio_varies_between_setups():
     tight = refine_levels_with_structure(
         _atr_levels(), _Structure(supports=[(97.0, 2)], resistances=[(104.0, 2)]),
         2.0, min_rr=MIN_RR,
@@ -115,18 +159,6 @@ def test_the_ratio_now_varies_between_setups():
         2.0, min_rr=MIN_RR,
     )
     assert tight.rr != generous.rr
-    assert tight.rr == pytest.approx(4.0 / 3.0)
-    assert generous.rr == pytest.approx(20.0 / 4.0)
-
-
-def test_the_rr_gate_is_no_longer_a_tautology():
-    """A setup whose next obstacle does not pay should fail the gate."""
-    levels = _atr_levels()
-    refined = refine_levels_with_structure(
-        levels, _Structure(supports=[(96.0, 2)], resistances=[(100.5, 2)]),
-        2.0, min_rr=MIN_RR,
-    )
-    assert refined.rr < MIN_RR
 
 
 # -- shorts are mirrored ---------------------------------------------------------------
@@ -138,11 +170,14 @@ def test_a_short_uses_resistance_for_the_stop_and_support_for_the_target():
         2.0,
         min_rr=MIN_RR,
     )
-    # Above the entry, because a short is defended from overhead.
-    assert refined.stop == pytest.approx(105.0)
+    # Above the entry, because a short is defended from overhead, plus the buffer.
+    assert refined.stop == pytest.approx(105.0 + STRUCTURE_STOP_BUFFER_ATR * 2.0)
     # Below the entry, because that is where the profit is.
     assert refined.primary_target == pytest.approx(90.0)
-    assert refined.rr == pytest.approx(10.0 / 5.0)
+    # 10 of reward against 6 of risk: below 2:1, and the function says so
+    # instead of reaching for a target the chart never offered.
+    assert refined.rr == pytest.approx(10.0 / 6.0)
+    assert refined.rr < MIN_RR
 
 
 # -- it never makes things worse --------------------------------------------------------

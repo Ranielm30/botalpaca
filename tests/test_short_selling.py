@@ -94,7 +94,9 @@ def _short_opportunity(**kw):
         entry=100.0,
         stop=110.0,
         target=92.0,
-        rr=1.5,
+        # The gate now demands 2:1. These cases are about the short gate, so
+        # the fixture has to sit above the ratio and let it pass.
+        rr=2.5,
         score=80.0,
     )
     defaults.update(kw)

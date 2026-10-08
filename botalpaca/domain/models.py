@@ -100,6 +100,12 @@ class IndicatorSet(Domain):
     lowest_20: float | None = None
     highest_52w: float | None = None
     lowest_52w: float | None = None
+    # Length of the last bar's rejection wicks measured in ATR units. A bounce
+    # off a level is only a bounce if something pushed price through the level
+    # and it came back; without these, proximity to a level looks identical to
+    # a rejection. Zero means the last bar rejected nothing in that direction.
+    bull_rejection_atr: float | None = None
+    bear_rejection_atr: float | None = None
 
 
 class TrendState(Domain):

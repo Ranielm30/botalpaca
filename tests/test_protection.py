@@ -5,6 +5,7 @@ from __future__ import annotations
 import datetime as dt
 
 import pytest
+from alpaca.trading.enums import OrderClass
 
 from botalpaca.db.repositories import ProtectionRepository
 from botalpaca.domain.enums import ProtectionKind, TradingEnvironment
@@ -392,15 +393,21 @@ async def test_reconcile_never_creates_real_protection_for_paper_positions(datab
     assert not rows
 
 
+def _as_oco_group(*orders, group="grp-1"):
+    """Report orders the way Alpaca does when they really are one group."""
+    for order in orders:
+        order.order_class = OrderClass.OCO
+        order.group_ids = (group,)
+    return list(orders)
+
+
 async def test_reconcile_adopts_a_position_sqlite_never_saw(database):
     """A live position with no row used to be reported and then forgotten.
 
     The note said it had been adopted while nothing was written, so the
     frozen-risk baseline stayed NULL for the whole life of the trade.
     """
-    manager, engine, _ = await _setup(
-        database, [_stop_order("s1", stop=97.0), _tp_order("t1")]
-    )
+    manager, engine, _ = await _setup(database, [_stop_order("s1", stop=97.0)])
     position = make_position(symbol="AAPL", entry=100.0, current=102.0)
 
     notes = await manager.reconcile(
@@ -414,7 +421,6 @@ async def test_reconcile_adopts_a_position_sqlite_never_saw(database):
     assert row.qty == pytest.approx(position.qty)
     assert row.entry_price == pytest.approx(100.0)
     assert row.stop_order_id == "s1"
-    assert row.take_profit_order_id == "t1"
 
 
 async def test_adoption_freezes_the_baseline_and_never_rewrites_it(database):
@@ -478,7 +484,10 @@ async def test_reconcile_restores_a_missing_take_profit(database):
 
 
 async def test_reconcile_says_nothing_when_both_exits_are_already_there(database):
-    manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0), _tp_order("t1")])
+    manager, engine, client = await _setup(
+        database,
+        _as_oco_group(_stop_order("s1", stop=97.0), _tp_order("t1")),
+    )
     await manager._persist(
         PAPER, "AAPL", qty=10.0, entry_price=100.0, take_profit_price=110.0
     )
@@ -489,7 +498,34 @@ async def test_reconcile_says_nothing_when_both_exits_are_already_there(database
         protect_missing=True,
     )
 
-    assert not [n for n in notes if "objetivo" in n]
+    assert notes == []
+
+
+async def test_two_loose_exits_are_folded_into_one_group(database):
+    """A stop and a target standing on their own cannot both fire.
+
+    Alpaca lets one order hold the position, so two independent exits is one
+    exit too many. Reconciliation folds them into a single OCO.
+    """
+    manager, engine, client = await _setup(
+        database, [_stop_order("s1", stop=97.0), _tp_order("t1")]
+    )
+    await manager._persist(
+        PAPER, "AAPL", qty=10.0, entry_price=100.0, take_profit_price=110.0
+    )
+
+    notes = await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="AAPL", entry=100.0, current=102.0)],
+        protect_missing=True,
+    )
+
+    assert any("un solo grupo" in n for n in notes), notes
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "AAPL")
+    assert row.order_class == "oco"
+    assert row.take_profit_order_id is not None
+    assert row.stop_order_id not in (None, "s1")
 
 
 async def test_a_target_the_market_has_already_passed_is_refused(database):

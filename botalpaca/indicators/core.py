@@ -28,6 +28,7 @@ __all__ = [
     "macd",
     "mean",
     "obv",
+    "rejection_wicks",
     "roc",
     "rsi",
     "sma",
@@ -360,6 +361,42 @@ def lowest(values: ArrayLike, period: int) -> np.ndarray:
     for i in range(period - 1, arr.size):
         out[i] = float(np.min(arr[i - period + 1 : i + 1]))
     return out
+
+
+def rejection_wicks(
+    open_: ArrayLike, high: ArrayLike, low: ArrayLike, close: ArrayLike
+) -> tuple[float, float]:
+    """Size of the last bar's rejection wicks, as a fraction of its own range.
+
+    Returns ``(bullish, bearish)``:
+
+    * ``bullish`` -- the lower wick, the tail that pushed price down and was
+      bought back. This is the "rejection at support" a bounce setup needs.
+    * ``bearish`` -- the upper wick, the mirror: rejection at resistance.
+
+    Both are ``0.0`` on a bar with no range to divide by.
+
+    A wick is only a wick when the body closed away from it: a bar that
+    gaps or closes on its low has a lower wick that nobody rejected. So the
+    measurement only counts the tail that closed *against* the excursion,
+    which is what separates a hammer from a candle that simply fell.
+
+    Neither value is a verdict. It says how much of the bar was rejected, not
+    whether that rejection was worth trading -- the caller decides the
+    threshold it is willing to accept.
+    """
+    o, h, l, c = (_as_array(v) for v in (open_, high, low, close))
+    if not (o.size and h.size and l.size and c.size):
+        return 0.0, 0.0
+    o, h, l, c = (arr[-1] for arr in (o, h, l, c))
+    span = float(h - l)
+    if not np.isfinite(span) or span <= 0:
+        return 0.0, 0.0
+    lower = float(min(o, c) - l)
+    upper = float(h - max(o, c))
+    bullish = lower / span if float(c) >= float(l) + span / 2.0 else 0.0
+    bearish = upper / span if float(c) <= float(l) + span / 2.0 else 0.0
+    return max(bullish, 0.0), max(bearish, 0.0)
 
 
 def mean(values: ArrayLike) -> float:
