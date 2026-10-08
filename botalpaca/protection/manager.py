@@ -290,6 +290,8 @@ class PositionProtectionManager:
         entry_price: float,
         stop_order_id: str | None = None,
         take_profit_order_id: str | None = None,
+        stop_price: float | None = None,
+        take_profit_price: float | None = None,
         order_class: OrderClass | str | None = None,
         time_stop_minutes: int | None = None,
         initial_stop_price: float | None = None,
@@ -299,6 +301,12 @@ class PositionProtectionManager:
         ``initial_stop_price`` freezes the risk this trade was opened with. It is
         written only if the row has none, so re-registering a trade never resets
         the baseline a position is already being judged against.
+
+        ``stop_price`` and ``take_profit_price`` write the *levels*, not just
+        the order ids. The ids are only links to the legs Alpaca agreed to, and
+        those legs are DAY orders that expire at the close; once they are gone
+        the ids point at nothing and the levels have to be remembered on our
+        side for the protection to be rebuilt the next morning.
         """
         order_class_value = getattr(order_class, "value", order_class)
         minutes = self._settings.default_time_stop_minutes if time_stop_minutes is None else time_stop_minutes
@@ -314,6 +322,8 @@ class PositionProtectionManager:
                 entry_price=entry_price,
                 stop_order_id=stop_order_id,
                 take_profit_order_id=take_profit_order_id,
+                stop_price=stop_price,
+                take_profit_price=take_profit_price,
                 order_class=order_class_value,
                 time_stop_at=time_stop_at,
             )
@@ -727,7 +737,22 @@ class PositionProtectionManager:
                 return merged
 
 
-        price = stop_price if stop_price is not None else self._fallback_stop(position, atr)
+        # The fallback is measured from the live price, which is the only way to
+        # protect a naked position with no entry price and no ATR. It knows
+        # nothing about the risk the trade was approved for. A bracket whose DAY
+        # legs expired at the close looks naked, and rebuilding the stop from the
+        # closing price can put it *wider* than the one Alpaca just let die --
+        # the position then carries twice the risk it was opened with, having
+        # risked nothing in between. The frozen baseline is the surviving record
+        # of that risk, so it wins here whenever it is still a legal stop.
+        fallback = self._fallback_stop(position, atr)
+        price = (
+            stop_price
+            if stop_price is not None
+            else self._tighten_with_baseline(
+                fallback, position, state.initial_stop_price
+            )
+        )
         if price is None:
             raise ValidationError(
                 f"No se puede calcular un stop para {position.symbol} sin ATR ni precio explícito"
@@ -920,6 +945,35 @@ class PositionProtectionManager:
         if position.qty >= 0:
             return position.current_price - distance
         return position.current_price + distance
+
+    @staticmethod
+    def _tighten_with_baseline(
+        price: float | None, position: PositionSnapshot, baseline: float | None
+    ) -> float | None:
+        """Keep an emergency stop no looser than the risk the trade opened with.
+
+        The caller passed that risk when it approved the position and Alpaca
+        accepted it, but the *price* only lives in the order ids, and those are
+        DAY legs that die at the close. The frozen baseline is the one record
+        that survives, so when a naked position has to be re-stopped the
+        baseline decides the level rather than the price the market closed at.
+
+        For a long the tighter stop is the *higher* price, and for a short the
+        lower one -- the mirror of the protection direction. Returns ``price``
+        untouched when there is nothing to tighten against, or when the
+        baseline already sits on the wrong side of the market: a stop placed
+        beyond the price is rejected by Alpaca, and an unprotected position is
+        a worse outcome than a wide one.
+        """
+        if price is None or baseline is None or position.current_price <= 0:
+            return price
+        price = round(float(price), 2)
+        frozen = round(float(baseline), 2)
+        if position.qty >= 0 and frozen < position.current_price:
+            return max(price, frozen)
+        if position.qty < 0 and frozen > position.current_price:
+            return min(price, frozen)
+        return price
 
     @staticmethod
     def _sanitize_stop(price: float, position: PositionSnapshot) -> float:

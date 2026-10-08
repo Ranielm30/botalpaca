@@ -459,6 +459,104 @@ async def test_adoption_does_not_reorder_anything_on_alpaca(database):
     assert row.stop_order_id is None
 
 
+
+# -- the levels the broker agreed to have to outlive the legs ---------------------------
+
+
+async def test_an_expired_bracket_stop_is_not_wider_than_the_risk_it_opened(database):
+    """A bracket whose DAY legs died at the close must not risk more overnight.
+
+    Alpaca cancels both children of a DAY bracket when the market shuts, so
+    reconciliation rebuilds the stop from the closing price. Measured that way,
+    QQQ would have gone from a 12.34 risk at the entry to 28.21 -- more than
+    double, for doing nothing. The frozen baseline is the only record of the
+    risk the caller approved, so it decides the level.
+    """
+    manager, _, client = await _setup(database, [], env=PAPER)  # no live orders
+    position = make_position(symbol="QQQ", entry=753.738, current=747.93)
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="QQQ",
+        qty=33.0,
+        entry_price=753.738,
+        initial_stop_price=741.40,
+    )
+    state = await manager.ensure_stop(
+        environment=PAPER,
+        position=position,
+        atr=8.76,
+        reason="reconciliación",
+    )
+    # The fallback alone would put the stop at 747.93 - 2*8.76 = 730.41.
+    assert state.stop_price == pytest.approx(741.40)
+    assert client.submitted  # a real order went out, not just a number
+
+
+async def test_an_emergency_stop_still_tightens_when_the_baseline_is_too_far(database):
+    """The baseline caps the risk upward, it never loosens a stop that is closer.
+
+    A trade that already sits below where its stop was opened gets a re-stop
+    tighter than the baseline, and that has to survive: the rule is a floor on
+    protection, not a preference for the opening number.
+    """
+    manager, _, client = await _setup(database, [], env=PAPER)
+    position = make_position(symbol="AAPL", entry=100.0, current=104.0)
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="AAPL",
+        qty=10.0,
+        entry_price=100.0,
+        initial_stop_price=97.0,
+    )
+    state = await manager.ensure_stop(
+        environment=PAPER, position=position, atr=1.0, reason="reconciliación"
+    )
+    # Fallback: 104.0 - 2*1.0 = 102.0, tighter than the frozen 97.0.
+    assert state.stop_price == pytest.approx(102.0)
+
+
+async def test_the_levels_alpaca_accepted_are_written_not_just_the_order_ids(database):
+    """The ids alone point at DAY legs that expire, so the prices are recorded too.
+
+    Losing the levels is what left six positions without a target: the bracket
+    legs died at the close and the row only remembered which orders they were.
+    """
+    manager, _, _ = await _setup(database, [], env=PAPER)
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="AAPL",
+        qty=10.0,
+        entry_price=100.0,
+        stop_order_id="s-1",
+        take_profit_order_id="t-1",
+        stop_price=95.0,
+        take_profit_price=110.0,
+    )
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "AAPL")
+    assert row.stop_price == pytest.approx(95.0)
+    assert row.take_profit_price == pytest.approx(110.0)
+
+
+async def test_a_position_that_never_recorded_a_target_can_still_be_restored(database):
+    """Rebuilding a dead bracket needs the level, and the level comes along now."""
+    manager, _, _ = await _setup(database, [], env=PAPER)
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="AAPL",
+        qty=10.0,
+        entry_price=100.0,
+        stop_order_id="s-1",
+        take_profit_order_id="t-1",
+        stop_price=95.0,
+        take_profit_price=110.0,
+    )
+    position = make_position(symbol="AAPL", entry=100.0, current=102.0)
+    notes = await manager.reconcile(
+        environment=PAPER, positions=[position], protect_missing=True
+    )
+    assert any("objetivo de beneficio restaurado" in n for n in notes)
+
 # -- the target is protection too ---------------------------------------------------
 async def test_reconcile_restores_a_missing_take_profit(database):
     """A stop without a target is half a position: it caps the loss and lets a

@@ -726,6 +726,8 @@ class Application:
             initial_stop_price=plan.stop_loss,
             stop_order_id=stop_leg.id if stop_leg else None,
             take_profit_order_id=tp_leg.id if tp_leg else None,
+            stop_price=plan.stop_loss,
+            take_profit_price=plan.take_profit,
             order_class=plan.order_class,
         )
 
