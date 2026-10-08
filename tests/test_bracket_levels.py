@@ -56,9 +56,10 @@ def test_a_raw_structural_price_never_reaches_the_broker():
         atr=6.0,
         min_rr=1.5,
     )
-    # Below the support by the noise buffer, and rounded on the way out: the
-    # raw level carried every decimal the bar data had.
-    assert refined.stop == 96.65
+    # The support sits 6.02 away and the buffer adds 3 more, which is 1.5 ATR --
+    # too close to sit behind, so the raw level never reaches the broker and
+    # the ATR stop stands instead.
+    assert refined.stop == 99.65
     assert refined.primary_target == 1194.47, refined.primary_target
     # Two decimals is what Alpaca accepts at or above $1.00.
     for price in (refined.stop, refined.primary_target):

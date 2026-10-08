@@ -932,35 +932,53 @@ class Application:
         The same unresolved problem is re-discovered every cycle, so identical
         reports are only sent when they change. A repeat that clears is worth
         saying, because silence on a recovery looks like a stale warning.
+
+        Notes arrive with a leading emoji and there are two very different
+        things hiding behind them. A position that cannot be protected is an
+        alarm, and those carry ``🚨`` or ``❌``. A trade the broker just closed
+        -- take profit, stop, or a fill the ledger had to settle on its own --
+        carries ``📕``, and a target the reconciler had to restore carries
+        ``🎯``. Both are things the operator asked to hear about, and the
+        filter that used to admit only the alarms meant a close by stop or by
+        target reached the log and nothing else: the position was gone, the
+        trade was recorded, and Telegram stayed quiet. They are reported as
+        their own section so a close is never buried inside an alarm and an
+        alarm is never diluted by routine bookkeeping.
         """
-        actionable = [n for n in notes if "🚨" in n or "❌" in n]
-        if not actionable:
+        urgent = [n for n in notes if "🚨" in n or "❌" in n]
+        events = [n for n in notes if "📕" in n or "⚠️" in n or "🎯" in n]
+        if not urgent and not events:
             self._reconcile_state = None
             return
 
-        lines = []
-        for note in actionable:
-            # One sentence per position: the note is written for a log reader.
-            symbol, _, reason = note.partition(": ")
-            lines.append(f"{symbol}\n   {reason}")
+        def _lines(items: list[str]) -> list[str]:
+            rendered = []
+            for note in items:
+                # One sentence per position: the note is written for a log reader.
+                symbol, _, reason = note.partition(": ")
+                rendered.append(f"{symbol}\n   {reason}")
+            return rendered
 
-        fingerprint = "\n".join(sorted(actionable))
+        fingerprint = "\n".join(sorted(urgent + events))
         previous = self._reconcile_state
         self._reconcile_state = fingerprint
         if fingerprint == previous:
             return
 
-        text = "\n".join(
-            [
+        sections = []
+        if events:
+            sections += ["<b>Operaciones</b>", "", *_lines(events)]
+        if urgent:
+            sections += [
                 "<b>Aviso de proteccion</b>",
-                f"Entorno: {environment.value}",
                 "",
-                *lines,
+                *_lines(urgent),
                 "",
                 "📈 Alpaca retiene las acciones de esas ordenes hasta "
                 "que el mercado abra. El bot lo reintenta solo.",
             ]
-        )
+
+        text = "\n".join([f"Entorno: {environment.value}", "", *sections])
         try:
             await self.notifications.send(text, force=True)
         except Exception:  # noqa: BLE001 - a notice must never break reconciliation

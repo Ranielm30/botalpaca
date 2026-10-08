@@ -185,6 +185,104 @@ async def test_assess_trims_when_notional_above_cap(database):
     assert result.reasons
 
 
+# -- the per-trade cap is a share of the capital still free ----------------------
+# Measured against the whole account, the first trade takes the same allowance
+# the tenth would get and everything after it is squeezed down to the crumbs.
+# Measured against what is undeployed, each order takes its cut of the remainder.
+
+
+async def test_the_first_order_measured_the_whole_account(database):
+    engine = _engine(
+        database,
+        max_concentration_pct=25.0,
+        max_sector_exposure_pct=100.0,
+        max_total_exposure_pct=100.0,
+        max_correlated_exposure_pct=100.0,
+    )
+    result = await engine.assess(make_opportunity(), _context(equity=100_000.0))
+    # Nothing is invested yet, so free capital is the whole 100k.
+    assert result.suggested_qty * 100.0 == pytest.approx(25_000.0)
+
+
+async def test_each_order_takes_a_quarter_of_what_is_left_free(database):
+    from botalpaca.risk.engine import OpenExposure
+
+    engine = _engine(
+        database,
+        max_concentration_pct=25.0,
+        max_sector_exposure_pct=100.0,
+        max_total_exposure_pct=100.0,
+        max_correlated_exposure_pct=100.0,
+    )
+    ctx = _context(
+        equity=100_000.0,
+        open_positions=[OpenExposure(symbol="AAPL", sector="TECHNOLOGY", notional=75_000.0)],
+    )
+    result = await engine.assess(make_opportunity(), ctx)
+    # 25% of the remaining 25k, not 25% of the 100k account.
+    assert result.suggested_qty * 100.0 == pytest.approx(6_200.0)  # 62 whole shares
+    assert result.approved
+
+
+async def test_the_cap_shrinks_as_the_book_fills(database):
+    from botalpaca.risk.engine import OpenExposure
+
+    engine = _engine(
+        database,
+        max_concentration_pct=25.0,
+        max_sector_exposure_pct=100.0,
+        max_total_exposure_pct=100.0,
+        max_correlated_exposure_pct=100.0,
+    )
+    sizes = []
+    for invested in (0.0, 25_000.0, 50_000.0):
+        ctx = _context(
+            equity=100_000.0,
+            open_positions=[OpenExposure(symbol="X", sector="TECHNOLOGY", notional=invested)],
+        )
+        result = await engine.assess(make_opportunity(), ctx)
+        sizes.append(result.suggested_qty * 100.0)
+    assert sizes == pytest.approx([25_000.0, 18_700.0, 12_500.0])
+
+
+async def test_nothing_left_free_blocks_the_next_order(database):
+    from botalpaca.risk.engine import OpenExposure
+
+    engine = _engine(
+        database,
+        max_concentration_pct=25.0,
+        max_sector_exposure_pct=100.0,
+        max_total_exposure_pct=100.0,
+        max_correlated_exposure_pct=100.0,
+    )
+    ctx = _context(
+        equity=100_000.0,
+        open_positions=[OpenExposure(symbol="X", sector="TECHNOLOGY", notional=100_000.0)],
+    )
+    result = await engine.assess(make_opportunity(), ctx)
+    assert not result.approved
+    assert any("libre" in b for b in result.blocks)
+
+
+async def test_the_free_cap_does_not_inflate_a_small_risk_budget(database):
+    from botalpaca.risk.engine import OpenExposure
+
+    engine = _engine(
+        database,
+        max_concentration_pct=25.0,
+        max_sector_exposure_pct=100.0,
+        max_total_exposure_pct=100.0,
+        max_correlated_exposure_pct=100.0,
+    )
+    ctx = _context(
+        equity=100_000.0,
+        open_positions=[OpenExposure(symbol="X", sector="TECHNOLOGY", notional=75_000.0)],
+    )
+    # A stop 20 wide costs 20 a share, so the 1% budget only reaches 50 shares.
+    result = await engine.assess(make_opportunity(stop=80.0, target=120.0, rr=2.0), ctx)
+    assert result.suggested_qty == pytest.approx(50.0)
+
+
 async def test_daily_loss_limit_blocks(database):
     engine = _engine(database, max_daily_loss_pct=1.0)
     repo = DailyPnlRepository

@@ -100,6 +100,16 @@ MAX_STOP_ATR = 3.0
 # A stop placed exactly on a swing level gets taken out by the wick that
 # tests it. The level is the reference, not the trigger.
 STRUCTURE_STOP_BUFFER_ATR = 0.5
+# ...and a level has to be worth sitting behind. A support resting right under
+# the entry is not a floor, it is noise the market already walks through: with
+# the buffer on top of it the stop landed around 1.3 ATR, well inside the range
+# a single ordinary day can cross. A tight stop then also wrecks the sizing --
+# every share is cheap in risk, so reaching the 1% budget needs so many shares
+# that the concentration cap cuts the position down to a rounding error.
+# A structural stop is therefore only adopted when it is at least as wide as
+# the ATR stop it would replace. When no level clears it, the ATR stop stands:
+# this sharpens a setup, it never removes one.
+MIN_FINAL_STOP_ATR = 2.0
 
 
 def refine_levels_with_structure(
@@ -125,7 +135,8 @@ def refine_levels_with_structure(
     A level is only adopted when it is genuinely usable:
 
     * the stop must sit beyond a support the market has tested (or resistance
-      for a short), and never so close that ordinary noise reaches it;
+      for a short), and never closer than ``MIN_FINAL_STOP_ATR`` -- a level too
+      near to sit behind leaves the stop inside the noise;
     * the target must clear ``min_rr``; if the closest obstacle does not, the
       next one is taken, and the ATR target is kept only when nothing on the
       chart is reachable.
@@ -170,7 +181,8 @@ def refine_levels_with_structure(
             lvl
             for lvl in defensive
             if _beyond(lvl.price, levels.entry)
-            and _distance(lvl.price) + buffer_size >= min_stop_atr * atr
+            and _distance(lvl.price) + buffer_size
+            >= max(min_stop_atr, MIN_FINAL_STOP_ATR) * atr
             and _distance(lvl.price) + buffer_size <= cap
         ),
         key=lambda lvl: _distance(lvl.price),

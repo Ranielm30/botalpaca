@@ -85,22 +85,31 @@ def test_the_stop_sits_beyond_the_nearest_support_with_a_noise_buffer():
 
 
 def test_the_nearest_support_wins_not_the_deepest():
-    """Widening the risk buys no information and only makes the ratio harder."""
+    """Widening the risk buys no information and only makes the ratio harder.
+
+    Both levels here are wide enough to sit behind, so the choice between them
+    is the one the floor does not decide.
+    """
     levels = _atr_levels()
     refined = refine_levels_with_structure(
-        levels, _Structure(supports=[(96.0, 3), (98.0, 1)]), 2.0, min_rr=MIN_RR
+        levels, _Structure(supports=[(96.0, 3), (95.5, 1)]), 2.0, min_rr=MIN_RR
     )
-    assert refined.stop == pytest.approx(98.0 - STRUCTURE_STOP_BUFFER_ATR * 2.0)
+    assert refined.stop == pytest.approx(96.0 - STRUCTURE_STOP_BUFFER_ATR * 2.0)
 
 
-def test_the_buffer_is_what_protects_from_the_noise():
-    """A level sitting right under the entry is still usable: the buffer is
-    the protection now, not the distance of the level itself."""
+def test_a_support_too_near_to_sit_behind_is_not_used():
+    """A level resting right under the entry is noise, not a floor.
+
+    Adopting it put the stop half an ATR away -- inside the range a single
+    ordinary day crosses -- and then wrecked the position size on top of that.
+    The ATR stop stands instead: it is the same 2 ATR the level would have had
+    to beat to be worth taking.
+    """
     levels = _atr_levels()
     refined = refine_levels_with_structure(
         levels, _Structure(supports=[(99.8, 3)]), 2.0, min_rr=MIN_RR
     )
-    assert refined.stop == pytest.approx(99.8 - STRUCTURE_STOP_BUFFER_ATR * 2.0)
+    assert refined.stop == pytest.approx(levels.stop)
 
 
 def test_the_stop_never_reaches_past_the_measured_band():

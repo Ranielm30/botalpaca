@@ -154,6 +154,68 @@ async def test_a_clean_reconciliation_says_nothing():
     assert app.notifications.sent == []
 
 
+async def test_a_take_profit_close_reaches_the_operator():
+    """The position is gone and the trade is recorded. Silence on that is the
+    one thing an operator cannot interpret: it reads exactly like still open."""
+    from botalpaca.app import Application
+
+    app = _App()
+    note = "📕 LLY: cerrada en el ledger por TARGET a 1,186.14 (P&L +182.48, R +0.08)"
+
+    await Application._notify_reconciliation(app, TradingEnvironment.PAPER, [note])
+
+    assert len(app.notifications.sent) == 1
+    text, _ = app.notifications.sent[0]
+    assert "Operaciones" in text
+    assert "TARGET" in text
+    assert "+182.48" in text
+
+
+async def test_a_stop_close_reaches_the_operator():
+    from botalpaca.app import Application
+
+    app = _App()
+    note = "📕 AVGO: cerrada en el ledger por STOP a 365.26 (P&L -350.00, R -1.00)"
+
+    await Application._notify_reconciliation(app, TradingEnvironment.PAPER, [note])
+
+    text, _ = app.notifications.sent[0]
+    assert "STOP" in text
+    assert "-350.00" in text
+
+
+async def test_a_close_and_an_alarm_each_get_their_own_section():
+    """A close must not be buried inside an alarm, and an alarm must not be
+    diluted by routine bookkeeping."""
+    from botalpaca.app import Application
+
+    app = _App()
+    notes = [
+        "📕 QQQ: cerrada en el ledger por STOP a 741.40 (P&L -500.00, R -1.00)",
+        "🚨 MSFT: 1 orden(es) inertes retienen las acciones",
+    ]
+
+    await Application._notify_reconciliation(app, TradingEnvironment.PAPER, notes)
+
+    text, _ = app.notifications.sent[0]
+    assert text.index("Operaciones") < text.index("Aviso de proteccion")
+    assert "STOP" in text and "🚨" in text
+    # The footer about held shares only belongs with the alarm.
+    assert text.count("retiene las acciones") == 1
+
+
+async def test_a_repeated_close_is_only_sent_once():
+    from botalpaca.app import Application
+
+    app = _App()
+    note = "📕 LLY: cerrada en el ledger por TARGET a 1,186.14 (P&L +182.48, R +0.08)"
+
+    await Application._notify_reconciliation(app, TradingEnvironment.PAPER, [note])
+    await Application._notify_reconciliation(app, TradingEnvironment.PAPER, [note])
+
+    assert len(app.notifications.sent) == 1
+
+
 async def test_a_broken_notifier_never_breaks_reconciliation():
     from botalpaca.app import Application
 

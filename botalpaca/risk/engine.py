@@ -281,8 +281,17 @@ class RiskEngine:
         # which is the intended behaviour of a fixed-fractional sizer.
         sector = opportunity.sector or sector_for_symbol(opportunity.symbol)
         if qty > 0 and equity > 0:
+            # The per-operation cap is a share of the capital still free, not of
+            # the whole account. Measured against the total equity it hands the
+            # first trade the same allowance the tenth one would get, and every
+            # position after it is squeezed down to whatever happens to be left.
+            # Measured against what is undeployed, each order takes its cut of
+            # the remainder, so the book fills up gradually instead of saturating
+            # on the first trade. The total-exposure cap below still bounds the
+            # sum, so this cannot compound into unbounded buying.
+            free_capital = max(0.0, equity - context.total_notional)
             caps = {
-                "concentración por operación": equity * s.max_concentration_pct / 100.0,
+                "concentración por operación": free_capital * s.max_concentration_pct / 100.0,
                 f"exposición del sector {sector}": max(
                     0.0, equity * s.max_sector_exposure_pct / 100.0 - context.sector_notional(sector)
                 ),
@@ -327,10 +336,12 @@ class RiskEngine:
             # Concentration and sector caps were already applied as trims
             # above; re-check after trimming so a cap of zero (already fully
             # allocated) still surfaces as a block rather than a silent pass.
-            if notional > equity * s.max_concentration_pct / 100.0:
+            free_capital = max(0.0, equity - context.total_notional)
+            if notional > free_capital * s.max_concentration_pct / 100.0:
                 blocks.append(
                     f"Concentración por operación excedida "
-                    f"(${notional:,.2f} > {s.max_concentration_pct}% de equity)"
+                    f"(${notional:,.2f} > {s.max_concentration_pct}% del capital libre "
+                    f"${free_capital:,.2f})"
                 )
 
             sector_total = context.sector_notional(sector) + notional
