@@ -307,7 +307,7 @@ def render_positions(
         lines.append("")
         lines.append(
             f"{fmt.trend_glyph(change)} <b>{fmt.esc(p.symbol)}</b>  ·  "
-            f"{_side_label(p.side)}"
+            f"{'SHORT' if p.qty < 0 else 'LONG'}"
         )
         lines.append(f"Entrada: {money(p.avg_entry_price)}")
         lines.append(f"Actual: {money(p.current_price)}")

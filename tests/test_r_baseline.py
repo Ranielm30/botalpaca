@@ -164,9 +164,9 @@ async def test_trailing_still_arms_when_the_baseline_survives_the_stop_moving(no
 
 # -- the floor -----------------------------------------------------------------------
 async def test_trailing_is_never_armed_below_break_even(notifying):
-    """A 2% trail from 340 is 333.20; the break-even floor is 332.45."""
+    """A 2% trail from 342 is 335.16; the break-even floor is 332.45."""
     manager = _manager(
-        initial_stop=327.14, live_stop=332.45, entry=331.948, current=340.0,
+        initial_stop=327.14, live_stop=332.45, entry=331.948, current=342.0,
         break_even_active=True,
     )
     sent, notify = notifying
@@ -176,7 +176,7 @@ async def test_trailing_is_never_armed_below_break_even(notifying):
         settings=ProtectionSettings(auto_break_even=False, auto_progressive=False),
         notify=notify,
     )
-    reports = await protector.evaluate(make_position(entry=331.948, current=340.0))
+    reports = await protector.evaluate(make_position(entry=331.948, current=342.0))
     floor = manager.trail_calls[0]["floor_stop"]
     assert floor == pytest.approx(332.45, abs=0.01)
     assert manager.state.trail_price > floor

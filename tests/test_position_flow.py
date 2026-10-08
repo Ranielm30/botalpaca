@@ -115,6 +115,28 @@ def test_render_positions_breaks_even():
     assert "break-even" in out
 
 
+def test_a_short_position_is_labelled_short():
+    """A negative quantity must render as SHORT, never as LONG.
+
+    ``_side_label`` used to return "LONG" for anything it did not
+    recognise, so a short whose ``side`` field did not match its set was
+    displayed as a long. The card now reads the sign of ``qty``.
+    """
+    short = _Position("SBUX", qty=-59.0, entry=89.98, current=90.92,
+                      pl=-55.46, plpc=-0.0616)
+    short.side = OrderSide.SELL
+    out = render_positions([short], PAPER)
+    assert "SHORT" in out
+    assert "LONG" not in out
+
+
+def test_a_long_position_is_labelled_long():
+    long_ = _Position("AAPL")
+    out = render_positions([long_], PAPER)
+    assert "LONG" in out
+    assert "SHORT" not in out
+
+
 # -- order cards ----------------------------------------------------------------------
 def test_render_orders_empty():
     out = render_orders([], PAPER)
