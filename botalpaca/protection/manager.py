@@ -485,6 +485,7 @@ class PositionProtectionManager:
         state: ProtectionState,
         *,
         stop_price: float | None = None,
+        target_price: float | None = None,
     ) -> ProtectionState | None:
         """Fold a standalone take-profit and the stop into one OCO group.
 
@@ -493,8 +494,11 @@ class PositionProtectionManager:
         carries both at once: the parent is the take-profit limit, the child is
         the stop. Anything less leaves the operator with a risk number and no
         target, which is exactly what a card advertising "R:R 1.5" must never do.
+
+        ``target_price`` lets a caller restore a level the ledger still knows
+        but the live state no longer carries.
         """
-        target = state.take_profit_price
+        target = target_price if target_price is not None else state.take_profit_price
         stop = stop_price if stop_price is not None else state.stop_price
         if target is None or stop is None:
             return None
@@ -662,6 +666,106 @@ class PositionProtectionManager:
             environment=environment.value,
             symbol=position.symbol,
             stop=price,
+            reason=reason,
+        )
+        return state
+
+    async def ensure_take_profit(
+        self,
+        *,
+        environment: TradingEnvironment,
+        position: PositionSnapshot,
+        target_price: float | None,
+        reason: str = "posición sin objetivo de beneficio",
+    ) -> ProtectionState:
+        """Guarantee a profit target exists. Places a real order when missing.
+
+        The mirror of :meth:`ensure_stop`. A stop on its own protects the
+        downside and then lets a winner sit forever, which is exactly what a
+        half-dismantled bracket leaves behind: both legs go away together and
+        only the stop gets rebuilt.
+        """
+        state = await self.state_for_position(environment, position)
+        if state.has_take_profit:
+            return state
+        if target_price is None:
+            raise ValidationError(
+                f"No se conoce el objetivo de beneficio de {position.symbol}"
+            )
+        long_position = position.qty >= 0
+        on_the_right_side = (
+            position.current_price < target_price
+            if long_position
+            else position.current_price > target_price
+        )
+        if not on_the_right_side:
+            raise ValidationError(
+                f"El objetivo {target_price} de {position.symbol} ya quedo del lado "
+                "equivocado del mercado; no tiene sentido perseguirlo"
+            )
+
+        # Two independent exits cannot share the shares, so a target added on
+        # top of a live stop has to travel with it inside one OCO group.
+        if state.has_stop:
+            merged = await self._merge_into_oco(
+                environment, position, state, target_price=target_price
+            )
+            if merged is not None and merged.has_take_profit:
+                return merged
+            raise ValidationError(
+                f"No se pudo reunir el stop y el objetivo de {position.symbol} "
+                "en un solo grupo"
+            )
+
+        await self._await_shares_free(
+            environment, position.symbol, ignore=state.inert_order_ids
+        )
+        try:
+            result = await self._submit_exit(
+                environment=environment,
+                request=OrderBuilder.build_protective_limit(
+                    symbol=position.symbol,
+                    qty=abs(position.qty),
+                    exit_side=position.direction,
+                    limit_price=target_price,
+                ),
+                symbol=position.symbol,
+            )
+        except (BotalpacaError, BrokerError, RuntimeError) as exc:
+            log.error(
+                "protection.take_profit_refused",
+                environment=environment.value,
+                symbol=position.symbol,
+                error=str(exc),
+            )
+            raise ValidationError(
+                f"No se pudo fijar el objetivo de {position.symbol}: "
+                f"{readable_reason(exc)}. LA POSICION NO TIENE OBJETIVO DE BENEFICIO"
+            ) from exc
+        if result.order is None or not result.order.id:
+            raise ValidationError(
+                f"Alpaca no confirmo el objetivo de beneficio para {position.symbol}"
+            )
+        await self._persist(
+            environment,
+            position.symbol,
+            qty=abs(position.qty),
+            entry_price=position.avg_entry_price,
+            take_profit_order_id=result.order.id,
+            take_profit_price=target_price,
+        )
+        state.has_take_profit = True
+        state.take_profit_order_id = result.order.id
+        state.take_profit_price = target_price
+        state.notes.append(
+            f"Objetivo de beneficio fijado en {target_price} ({reason})"
+        )
+        log.warning(
+            "protection.take_profit_created",
+            environment=environment.value,
+            symbol=position.symbol,
+            take_profit=target_price,
+            order=result.order.id,
             reason=reason,
         )
         return state
@@ -1280,6 +1384,36 @@ class PositionProtectionManager:
             # failure to protect a position that is already protected.
             if state.has_trailing:
                 continue
+            # The target is restored before the stop, because restoring it on a
+            # position that still has its stop goes through the OCO path and
+            # leaves both exits standing; the reverse order would build a bare
+            # limit on top of a stop that already holds the shares.
+            if not state.has_take_profit:
+                row = stored.get(symbol)
+                target = row.take_profit_price if row is not None else None
+                if target is None:
+                    notes.append(f"⚠️ {symbol}: posición abierta SIN objetivo de beneficio")
+                elif not auto:
+                    notes.append(
+                        f"⚠️ {symbol}: SIN objetivo de beneficio en {target} "
+                        "(protección automática desactivada)"
+                    )
+                else:
+                    try:
+                        await self.ensure_take_profit(
+                            environment=environment,
+                            position=position,
+                            target_price=target,
+                            reason="reconciliación",
+                        )
+                        notes.append(f"🎯 {symbol}: objetivo de beneficio restaurado en {target}")
+                    except Exception as exc:  # noqa: BLE001 - reconciliation must not abort
+                        notes.append(
+                            f"⚠️ {symbol}: SIN objetivo de beneficio — {readable_reason(exc)}"
+                        )
+                        log.error(
+                            "protection.reconcile.target_failed", symbol=symbol, error=str(exc)
+                        )
             if not state.has_stop:
                 if not auto:
                     notes.append(f"⚠️ {symbol}: posición abierta SIN stop en Alpaca")

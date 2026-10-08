@@ -451,3 +451,52 @@ async def test_adoption_does_not_reorder_anything_on_alpaca(database):
         row = await ProtectionRepository(session).get(PAPER, "AAPL")
     assert row is not None
     assert row.stop_order_id is None
+
+
+# -- the target is protection too ---------------------------------------------------
+async def test_reconcile_restores_a_missing_take_profit(database):
+    """A stop without a target is half a position: it caps the loss and lets a
+    winner run forever. Reconciliation used to only ever restore the stop."""
+    manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0)])
+    # The ledger remembers the level the trade was opened with; Alpaca has no
+    # order carrying it.
+    await manager._persist(
+        PAPER, "AAPL", qty=10.0, entry_price=100.0, take_profit_price=110.0
+    )
+
+    notes = await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="AAPL", entry=100.0, current=102.0)],
+        protect_missing=True,
+    )
+
+    assert any("objetivo de beneficio restaurado" in n for n in notes)
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "AAPL")
+    assert row is not None
+    assert row.take_profit_order_id is not None
+
+
+async def test_reconcile_says_nothing_when_both_exits_are_already_there(database):
+    manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0), _tp_order("t1")])
+    await manager._persist(
+        PAPER, "AAPL", qty=10.0, entry_price=100.0, take_profit_price=110.0
+    )
+
+    notes = await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="AAPL", entry=100.0, current=102.0)],
+        protect_missing=True,
+    )
+
+    assert not [n for n in notes if "objetivo" in n]
+
+
+async def test_a_target_the_market_has_already_passed_is_refused(database):
+    manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0)])
+    with pytest.raises(ValidationError, match="lado equivocado"):
+        await manager.ensure_take_profit(
+            environment=PAPER,
+            position=make_position(symbol="AAPL", entry=100.0, current=102.0),
+            target_price=98.0,
+        )
