@@ -557,6 +557,132 @@ async def test_a_position_that_never_recorded_a_target_can_still_be_restored(dat
     )
     assert any("objetivo de beneficio restaurado" in n for n in notes)
 
+async def test_a_stop_looser_than_the_risk_it_opened_with_is_tightened(database):
+    """The entry risk is the one that was approved, and it decides the stop.
+
+    Every time a DAY bracket dies at the close, the replacement stop is
+    derived from the closing price. That is how QQQ ended the day on a
+    725.53 stop against a 741.40 baseline: the risk the position was
+    opened with doubled without anyone deciding it. ``ensure_stop`` only
+    ever *creates* a stop, so nothing came back to compare the two.
+    """
+    manager, _, _ = await _setup(
+        database,
+        [_stop_order("s1", symbol="QQQ", stop=725.53),
+         _tp_order("t1", symbol="QQQ", limit=779.38)],
+        env=PAPER,
+    )
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="QQQ",
+        qty=33.0,
+        entry_price=753.738,
+        initial_stop_price=741.40,
+        stop_order_id="s1",
+        take_profit_order_id="t1",
+        stop_price=725.53,
+        take_profit_price=779.38,
+    )
+    notes = await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="QQQ", entry=753.738, current=748.25)],
+        protect_missing=True,
+    )
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "QQQ")
+    assert row.stop_price == pytest.approx(741.40)
+
+
+async def test_a_short_stop_is_measured_the_other_way_round(database):
+    """For a short the tighter stop is the *lower* price, mirrored from a long."""
+    manager, _, _ = await _setup(
+        database,
+        [fake_order_raw("s1", symbol="SBUX", order_type="stop", side="buy",
+                        stop_price=96.05, status="new"),
+         fake_order_raw("t1", symbol="SBUX", order_type="limit", side="buy",
+                        limit_price=79.83, status="new")],
+        env=PAPER,
+    )
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="SBUX",
+        qty=59.0,
+        entry_price=89.98,
+        initial_stop_price=95.05,
+        stop_order_id="s1",
+        take_profit_order_id="t1",
+        stop_price=96.05,
+        take_profit_price=79.83,
+    )
+    await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="SBUX", qty=-59.0, entry=89.98, current=93.21)],
+        protect_missing=True,
+    )
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "SBUX")
+    assert row.stop_price == pytest.approx(95.05)
+
+
+async def test_a_tighter_stop_is_never_loosened_by_the_comparison(database):
+    """The comparison only ever tightens. A stop already closer than the risk
+    the trade opened with is left exactly where it is."""
+    manager, _, _ = await _setup(
+        database,
+        [_stop_order("s1", symbol="MSFT", stop=506.93),
+         _tp_order("t1", symbol="MSFT", limit=586.32)],
+        env=PAPER,
+    )
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="MSFT",
+        qty=23.0,
+        entry_price=518.92,
+        initial_stop_price=506.93,
+        stop_order_id="s1",
+        take_profit_order_id="t1",
+        stop_price=506.93,
+        take_profit_price=586.32,
+    )
+    notes = await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="MSFT", entry=518.92, current=523.21)],
+        protect_missing=True,
+    )
+    assert not any("ajustado al riesgo" in n for n in notes)
+    async with database.session() as session:
+        row = await ProtectionRepository(session).get(PAPER, "MSFT")
+    assert row.stop_price == pytest.approx(506.93)
+
+
+async def test_a_frozen_level_already_past_the_market_is_left_alone(database):
+    """A stop beyond the price is refused by Alpaca, and a wide stop that works
+    beats an unprotected position."""
+    manager, _, _ = await _setup(
+        database,
+        [_stop_order("s1", symbol="AAPL", stop=97.0),
+         _tp_order("t1", symbol="AAPL", limit=110.0)],
+        env=PAPER,
+    )
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="AAPL",
+        qty=10.0,
+        entry_price=100.0,
+        initial_stop_price=103.0,  # already above the market: not a legal stop
+        stop_order_id="s1",
+        take_profit_order_id="t1",
+        stop_price=97.0,
+        take_profit_price=110.0,
+    )
+    notes = await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="AAPL", entry=100.0, current=102.0)],
+        protect_missing=True,
+    )
+    assert not any("ajustado al riesgo" in n for n in notes)
+
+
 # -- the target is protection too ---------------------------------------------------
 async def test_reconcile_restores_a_missing_take_profit(database):
     """A stop without a target is half a position: it caps the loss and lets a

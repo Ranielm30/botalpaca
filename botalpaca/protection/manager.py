@@ -976,6 +976,36 @@ class PositionProtectionManager:
         return price
 
     @staticmethod
+    def _looser_than_baseline(
+        state: ProtectionState, position: PositionSnapshot
+    ) -> float | None:
+        """The frozen risk, when the stop now live is wider than the trade opened with.
+
+        ``ensure_stop`` only ever *creates* a stop, and ``_tighten_with_baseline``
+        only runs on the way in. A stop that was written too wide -- which is
+        exactly what a DAY bracket leaves behind when it expires and the
+        replacement is derived from the closing price -- therefore stays wide
+        for the life of the position. Nothing ever comes back to compare it
+        against the risk that was approved.
+
+        This is that comparison. It hands back the frozen level only when that
+        is still a legal stop on the protected side of the market: a stop placed
+        beyond the price is refused by Alpaca, and leaving the wide one alone
+        beats taking the position out of protection in order to tighten it.
+        """
+        frozen = state.initial_stop_price
+        live = state.stop_price
+        if frozen is None or live is None or position.current_price <= 0:
+            return None
+        frozen = round(float(frozen), 2)
+        live = round(float(live), 2)
+        if position.qty >= 0 and frozen < position.current_price and frozen > live:
+            return frozen
+        if position.qty < 0 and frozen > position.current_price and frozen < live:
+            return frozen
+        return None
+
+    @staticmethod
     def _sanitize_stop(price: float, position: PositionSnapshot) -> float:
         price = round(float(price), 2)
         if price <= 0:
@@ -1571,6 +1601,13 @@ class PositionProtectionManager:
             # failure to protect a position that is already protected.
             if state.has_trailing:
                 continue
+            # The frozen baseline is the one record of the risk the caller
+            # approved, and a DAY bracket's leaves nothing behind but ids that
+            # die at the close. Measured against it, a stop wider than the trade
+            # opened with is handing back money that was already signed off on,
+            # so the tighter level is settled once here and used by both the
+            # grouping branch and the stop check below.
+            tighter = self._looser_than_baseline(state, position)
             # The target is restored before the stop, because restoring it on a
             # position that still has its stop goes through the OCO path and
             # leaves both exits standing; the reverse order would build a bare
@@ -1614,7 +1651,7 @@ class PositionProtectionManager:
                         environment=environment,
                         position=position,
                         state=state,
-                        stop_price=state.stop_price,
+                        stop_price=tighter if tighter is not None else state.stop_price,
                         target_price=state.take_profit_price,
                         replace_stop_id=state.stop_order_id,
                     )
@@ -1628,6 +1665,41 @@ class PositionProtectionManager:
                         notes.append(f"⚠️ {symbol}: dos salidas sueltas y el broker no admite el grupo")
                     else:
                         notes.append(f"🔗 {symbol}: stop y objetivo reunidos en un solo grupo")
+            # A stop wider than the risk the position opened with hands back
+            # money the operator already signed off on, so the live stop is
+            # measured against the frozen baseline on every pass. The rebuild
+            # goes through the OCO path, which releases the old stop and puts
+            # one straight back if the broker refuses the group: the position
+            # never ends the pass less protected than it started it.
+            if tighter is not None and state.has_take_profit and auto:
+                try:
+                    merged = await self._merge_into_oco(
+                        environment=environment,
+                        position=position,
+                        state=state,
+                        stop_price=tighter,
+                        target_price=state.take_profit_price,
+                        replace_stop_id=state.stop_order_id,
+                    )
+                except Exception as exc:  # noqa: BLE001 - reconciliation must not abort
+                    notes.append(
+                        f"⚠️ {symbol}: el stop quedó más ancho que el riesgo "
+                        f"aceptado y no se pudo ajustar — {readable_reason(exc)}"
+                    )
+                    log.error(
+                        "protection.reconcile.tighten_failed",
+                        symbol=symbol,
+                        error=str(exc),
+                    )
+                else:
+                    if merged is None or not merged.has_stop:
+                        notes.append(
+                            f"⚠️ {symbol}: el stop sigue más ancho que el riesgo aceptado"
+                        )
+                    else:
+                        notes.append(
+                            f"🔒 {symbol}: stop ajustado al riesgo aceptado ({tighter})"
+                        )
             if not state.has_stop:
                 if not auto:
                     notes.append(f"⚠️ {symbol}: posición abierta SIN stop en Alpaca")
