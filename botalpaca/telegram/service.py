@@ -1467,7 +1467,10 @@ class TelegramFacade:
                         f"{trade.strategy}"
                     )
             if not symbols:
-                trades = await repo.get_closed(environment, 15)
+                # `limit` is keyword-only in get_closed; a positional 15 here
+                # raises TypeError, which is why `/historial` with no symbols
+                # (the way it is typed most of the time) never answered.
+                trades = await repo.get_closed(environment, limit=15)
                 if not trades:
                     lines.append("\nSin operaciones cerradas todavía.")
                 for trade in trades:

@@ -36,6 +36,23 @@ def _args(context: ContextTypes.DEFAULT_TYPE) -> str | None:
     return " ".join(str(a) for a in args) if args else None
 
 
+def _argument_slot(parameters) -> str | None:
+    """Name of the parameter that receives the command line, if there is one.
+
+    A command takes the update first and at most one optional slot for what
+    the user typed after it. Naming that slot `args` happened to be the
+    convention, not a rule: `/detalles` called it `symbol`, so the arguments
+    were dropped on the floor. Looking for the first optional parameter
+    instead of a specific spelling keeps that from happening again.
+    """
+    for name, parameter in list(parameters.items())[1:]:
+        if name == "self" or name == "update":
+            continue
+        if parameter.default is not inspect.Parameter.empty:
+            return name
+    return None
+
+
 def _chat_id(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int | None:
     """Resolve the chat to reply to.
 
@@ -101,12 +118,18 @@ def _make_command(name: str, method_name: str):
     async def handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         facade: TelegramFacade = context.application.bot_data["facade"]
         method = getattr(facade, method_name)
-        # Only forward `args` when the command actually accepts it. `/start`,
-        # `/help` and `/status` take no arguments, and passing them anyway made
-        # every one of those commands fail with a TypeError.
+        # Only forward the arguments when the command actually accepts them.
+        # `/start`, `/help` and `/status` take no arguments, and passing them
+        # anyway made every one of those commands fail with a TypeError.
+        # The name of the parameter is not assumed: `/detalles` called it
+        # `symbol` and silently dropped whatever the user typed, because the
+        # check above only looked for a parameter spelled `args`. The first
+        # optional slot is the one that receives the command line, whatever it
+        # is called.
         extra: dict[str, object] = {}
-        if "args" in inspect.signature(method).parameters:
-            extra["args"] = _args(context)
+        target = _argument_slot(inspect.signature(method).parameters)
+        if target is not None:
+            extra[target] = _args(context)
         await _dispatch(update, context, method, **extra)
 
     return handler

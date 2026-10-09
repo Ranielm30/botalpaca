@@ -901,6 +901,24 @@ async def test_explicar_returns_the_journal_entry():
     assert "AAPL" in result.text
 
 
+async def test_the_history_without_a_symbol_lists_the_closed_trades():
+    """/historial typed on its own must answer.
+
+    `get_closed` takes `limit` keyword-only, and the call passed it by position.
+    That is a TypeError, which no command handler catches, so the command never
+    answered at all in the way it is used most of the time.
+    """
+    facade = TelegramFacade(FakeApp())
+    result = await facade.historial(_update(), None)
+    assert "Historial" in result.text
+
+
+async def test_the_history_of_one_symbol_is_looked_up_by_symbol():
+    facade = TelegramFacade(FakeApp())
+    result = await facade.historial(_update(), "AAPL")
+    assert "AAPL" in result.text
+
+
 # --------------------------------------------------------------------------------------
 # helpers that depend on real settings
 # --------------------------------------------------------------------------------------
@@ -1139,6 +1157,10 @@ async def test_commands_without_args_are_not_given_any():
             seen["args"] = args
             return "ok"
 
+        async def detalles(self, update: object, symbol: str | None = None) -> str:
+            seen["symbol"] = symbol
+            return "ok"
+
     context = SimpleNamespace(
         args=["PAPER"],
         application=SimpleNamespace(bot_data={"facade": _Facade()}),
@@ -1151,6 +1173,46 @@ async def test_commands_without_args_are_not_given_any():
         handler = _make_command(method_name, method_name)
         await handler(update, context)
         assert seen.get("kwargs") == ({"args": "PAPER"} if expects_args else {})
+
+
+async def test_a_command_that_names_its_argument_something_else_gets_it():
+    """/detalles typed `/detalles AAPL` and the facade received nothing.
+
+    The dispatcher used to forward the command line only to a parameter
+    spelled `args`. `/detalles` calls it `symbol`, so the symbol was dropped,
+    the command fell into its no-symbol branch, and the user got the list of
+    recent opportunities instead of the analysis they asked for. Whatever the
+    slot is called, it is the one that receives what was typed.
+    """
+    from types import SimpleNamespace
+
+    from botalpaca.telegram.bot import _make_command
+
+    seen: dict[str, object] = {}
+
+    async def _noop_send(*args: object, **kwargs: object) -> None:
+        return None
+
+    class _Facade:
+        async def guard(self, method, update, **kwargs):
+            seen["kwargs"] = kwargs
+            return await method(update, **kwargs)
+
+        async def detalles(self, update: object, symbol: str | None = None) -> object:
+            seen["symbol"] = symbol
+            return SimpleNamespace(text="ok", keyboard=None)
+
+    context = SimpleNamespace(
+        args=["AAPL"],
+        application=SimpleNamespace(bot_data={"facade": _Facade()}),
+        bot=SimpleNamespace(send_message=_noop_send),
+    )
+    update = SimpleNamespace(effective_chat=SimpleNamespace(id=1))
+
+    seen.clear()
+    handler = _make_command("detalles", "detalles")
+    await handler(update, context)
+    assert seen["symbol"] == "AAPL"
 
 
 # -- commands that previously only worked as buttons -------------------------------------
