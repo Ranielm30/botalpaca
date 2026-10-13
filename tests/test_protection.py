@@ -460,6 +460,33 @@ async def test_adoption_does_not_reorder_anything_on_alpaca(database):
 
 
 
+async def test_a_vanished_position_has_its_live_orders_cancelled(database):
+    """DOCU closed, the row was deleted, and two SIMPLE exits stayed LIVE behind.
+
+    Deleting the SQLite row alone left the broker orders standing. They were
+    a stop and a limit with no position under them, so a touch of either would
+    have opened a position nobody asked for. Reconcile has to cancel the exits
+    of a position Alpaca no longer reports, not just forget them.
+    """
+    manager, _, client = await _setup(
+        database, [_stop_order("s1", symbol="DOCU", stop=97.0)]
+    )
+    async with database.session() as session:
+        await ProtectionRepository(session).upsert(
+            PAPER, "DOCU", qty=129.0, entry_price=72.14, stop_order_id="s1",
+            stop_price=97.0,
+        )
+
+    notes = await manager.reconcile(
+        environment=PAPER, positions=[], protect_missing=True
+    )
+
+    assert "s1" in client.cancelled
+    assert any("orden" in n and "cancelada" in n for n in notes)
+    async with database.session() as session:
+        assert await ProtectionRepository(session).get(PAPER, "DOCU") is None
+
+
 # -- the levels the broker agreed to have to outlive the legs ---------------------------
 
 

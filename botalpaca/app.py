@@ -675,7 +675,7 @@ class Application:
         rr_now = reward / risk_usd if risk_usd > 0 else 0.0
         if rr_now < risk.min_rr_at_entry:
             raise _reject(
-                f"el R:R ahora es {rr_now:.2f}, por debajo del minimo "
+                f"el R:R ahora es {rr_now:.4f}, por debajo del minimo "
                 f"{risk.min_rr_at_entry:.2f} (venia {plan.rr:.2f})",
                 "REJECTED_DEGRADED_RR",
             )

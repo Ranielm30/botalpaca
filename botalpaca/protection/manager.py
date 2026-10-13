@@ -1718,6 +1718,31 @@ class PositionProtectionManager:
                     )
                     log.error("protection.reconcile.failed", symbol=symbol, error=str(exc))
         for symbol in sorted(set(stored) - set(live)):
+            # The position is gone, so its exits are gone too. Deleting the
+            # SQLite row alone left the broker orders live: DOCU closed
+            # manually, reconcile dropped the row, and two SIMPLE sell orders
+            # (a stop and a limit) stayed NEW with no position behind them —
+            # one fill away from opening a position nobody asked for.
+            for order in await self._engine.get_live_orders_for_symbol(symbol):
+                try:
+                    await self._engine.cancel_order(
+                        order.id, environment=environment
+                    )
+                    notes.append(
+                        f"🧹 {symbol}: orden {str(order.id)[:8]} cancelada "
+                        f"(la posición ya no existe)"
+                    )
+                except Exception as exc:  # noqa: BLE001 - never abort the sweep
+                    notes.append(
+                        f"⚠️ {symbol}: no se pudo cancelar la orden "
+                        f"{str(order.id)[:8]} — {readable_reason(exc)}"
+                    )
+                    log.error(
+                        "protection.reconcile.cancel_failed",
+                        symbol=symbol,
+                        order_id=str(order.id),
+                        error=str(exc),
+                    )
             await self.clear(environment, symbol)
             notes.append(f"🧹 {symbol}: protección borrada (ya no hay posición en Alpaca)")
 
