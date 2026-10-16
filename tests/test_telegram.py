@@ -203,6 +203,16 @@ class _Monitor:
     running = False
     last_result = None
 
+    def __init__(self) -> None:
+        self.auto = False
+
+    async def auto_trading_on(self) -> bool:
+        return self.auto
+
+    async def set_auto_trading(self, enabled: bool) -> bool:
+        self.auto = bool(enabled)
+        return self.auto
+
 
 class _Context:
     def __init__(self, environment: TradingEnvironment) -> None:

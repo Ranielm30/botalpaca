@@ -144,6 +144,7 @@ def register_handlers(bot_app: TelegramApplication, facade: TelegramFacade) -> N
         "help": "help",
         "status": "status",
         "modo": "modo",
+        "auto": "auto",
         "analizar": "analizar",
         "detalles": "detalles",
         "riesgo": "riesgo",
@@ -180,6 +181,7 @@ COMMAND_DESCRIPTIONS: dict[str, str] = {
     "help": "Índice de todos los comandos",
     "status": "Salud: base de datos, Alpaca, scheduler, kill switch",
     "modo": "Ver o cambiar entre ALPACA PAPER y ALPACA REAL",
+    "auto": "Ver o activar el modo automático de operación",
     "analizar": "Analizar el mercado y mostrar las mejores entradas",
     "detalles": "Detalle completo de un símbolo",
     "riesgo": "Límites de riesgo y exposición actual",
@@ -248,6 +250,8 @@ async def _route(
         return await facade.modo(update, payload)
     if action == kb.CONFIRM_ENV:
         return await facade.confirm_mode_switch(update, TradingEnvironment(payload))
+    if action == kb.CONFIRM_AUTO:
+        return await facade.confirm_auto(update, payload == "1")
     if action == kb.CONFIRM_TRADE:
         return await facade.confirm_trade(update, payload)
     if action == kb.CANCEL_PENDING:

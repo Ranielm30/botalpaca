@@ -38,7 +38,12 @@ from botalpaca.domain import (
     TradingEnvironment,
 )
 from botalpaca.domain.enums import SignalDirection
-from botalpaca.domain.errors import BotalpacaError, ConfigurationError, ValidationError
+from botalpaca.domain.errors import (
+    AuthorizationError,
+    BotalpacaError,
+    ConfigurationError,
+    ValidationError,
+)
 from botalpaca.execution import (
     ACTION_SUBMIT,
     AlpacaTradingClient,
@@ -53,6 +58,7 @@ from botalpaca.monitoring import MarketMonitor, PositionAlert, PositionMonitor
 from botalpaca.notifications import NotificationService
 from botalpaca.portfolio import PortfolioService
 from botalpaca.protection import PositionProtectionManager
+from botalpaca.protection.manager import readable_reason
 from botalpaca.risk import PortfolioRiskContext, RiskEngine
 from botalpaca.scanner import MarketScanner, ScanResult
 from botalpaca.security import (
@@ -238,6 +244,7 @@ class EnvironmentContext:
             app.database,
             environment=environment,
             notify=notify,
+            executor=self._auto_execute,
             settings=settings.monitoring,
         )
         self.positions = PositionGateway(
@@ -255,6 +262,76 @@ class EnvironmentContext:
         )
 
     # ------------------------------------------------------------------ helpers
+
+    async def _auto_execute(self, opportunity: Opportunity) -> None:
+        """Run the same gates a manual ACEPTAR would, without the tap.
+
+        The monitor calls this only when ``auto_trading_enabled`` is on. It is
+        deliberately a thin wrapper: every real decision -- allowlist, kill
+        switch, level re-validation against the live price, risk limits -- lives
+        in :meth:`Application.submit_plan`, the same place the manual path goes
+        through, so automatic execution cannot quietly acquire weaker gates than
+        the ones a human would have passed.
+
+        Failures are reported, never raised: the monitor must survive a rejected
+        opportunity and keep scanning the rest of the universe.
+        """
+        operator = self.app.settings.monitoring.auto_trading_user_id
+        if operator is None:
+            log.warning(
+                "app.auto_trading_without_operator",
+                symbol=opportunity.symbol,
+                note="MONITORING_AUTO_TRADING_USER_ID no configurado",
+            )
+            return
+        try:
+            self.app.security.allowlist.require(operator)
+        except AuthorizationError as exc:
+            log.warning(
+                "app.auto_trading_not_allowed",
+                symbol=opportunity.symbol,
+                error=str(exc),
+            )
+            return
+
+        # The scan's own snapshot is a scan old by the time this runs, so the
+        # symbol is analysed again: the level guards compare against the price
+        # as it is now, not as it was five minutes ago.
+        fresh = await self.app.analyze_symbol(opportunity.symbol)
+        plan, assessment = await self.app.build_plan(fresh)
+        try:
+            result = await self.app.submit_plan(
+                plan, assessment, user_id=operator, opportunity=fresh
+            )
+        except (ValidationError, BotalpacaError, RuntimeError) as exc:
+            log.warning(
+                "app.auto_trading_refused",
+                symbol=plan.symbol,
+                error=readable_reason(exc),
+            )
+            await self.app.notifications.send(
+                f"🤖 [AUTO] {plan.symbol}: entrada rechazada — {readable_reason(exc)}",
+                force=True,
+            )
+            return
+        order = result.order
+        detail = ""
+        if order is not None and order.id is not None:
+            detail = f" orden {order.id}"
+        log.info(
+            "app.auto_trading_executed",
+            symbol=plan.symbol,
+            qty=plan.qty,
+            entry=plan.entry,
+            stop=plan.stop_loss,
+            target=plan.take_profit,
+        )
+        await self.app.notifications.send(
+            f"🤖 [AUTO] {plan.symbol}: ejecutada por el modo automatico"
+            f"{detail} (entrada {plan.entry}, stop {plan.stop_loss}, "
+            f"objetivo {plan.take_profit})",
+            force=True,
+        )
 
     @property
     def is_active(self) -> bool:

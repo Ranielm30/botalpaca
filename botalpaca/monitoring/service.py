@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import datetime as dt
-from collections.abc import Sequence
+from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass, field
 
 from botalpaca.config import MonitoringSettings, ProtectionSettings, get_settings
@@ -41,6 +41,7 @@ log = get_logger(__name__)
 LAST_SCAN_KEY = "last_scan_at"
 LAST_RECONCILE_KEY = "last_reconcile_at"
 SCORE_PREFIX = "position_score:"
+AUTO_TRADING_KEY = "auto_trading"
 
 
 @dataclass
@@ -87,6 +88,7 @@ class MarketMonitor:
         *,
         environment: TradingEnvironment,
         notify: object | None = None,
+        executor: Callable[[Opportunity], Awaitable[None]] | None = None,
         settings: MonitoringSettings | None = None,
     ) -> None:
         self._scanner = scanner
@@ -94,6 +96,11 @@ class MarketMonitor:
         self._db = database
         self.environment = environment
         self._notify = notify
+        # Who runs the trade when automatic execution is switched on. Kept
+        # separate from the alert callback: notifying and executing are two
+        # different decisions, and a monitor that has no executor simply
+        # cannot execute anything even if the flag is on.
+        self._executor = executor
         self.settings = settings or get_settings().monitoring
         self.last_result: ScanResult | None = None
         self._last_alert: dict[str, dt.datetime] = {}
@@ -150,8 +157,6 @@ class MarketMonitor:
         self._running = False
 
     async def _maybe_alert(self, opportunity: Opportunity) -> None:
-        if self._notify is None:
-            return
         if not opportunity.tradable:
             return
         if opportunity.score < self.settings.opportunity_alert_min_score:
@@ -164,14 +169,6 @@ class MarketMonitor:
                 floor=self.settings.opportunity_alert_min_score,
             )
             return
-        if self.settings.auto_trading_enabled:
-            # Automatic execution is a deliberate, opt-in decision. Even when on,
-            # the alert is still sent so the action is auditable in Telegram.
-            log.warning(
-                "market_monitor.auto_trading_enabled",
-                symbol=opportunity.symbol,
-                note="auto execution requested but requires an approved plan",
-            )
         now = dt.datetime.now(dt.UTC)
         last = self._last_alert.get(opportunity.fingerprint)
         if last is not None and (now - last).total_seconds() < (
@@ -179,7 +176,50 @@ class MarketMonitor:
         ):
             return
         self._last_alert[opportunity.fingerprint] = now
-        await self._notify(opportunity)
+        if await self.auto_trading_on() and self._executor is not None:
+            # Execution is opt-in, and it still announces itself: the alert below
+            # goes out either way, so the operator can see what the bot did rather
+            # than discover it in the ledger. The executor runs the same gates a
+            # manual entry would -- kill switch, level re-validation, risk limits
+            # -- and it reports its own outcome, so one failure must not take the
+            # whole scan down with it.
+            try:
+                await self._executor(opportunity)
+            except Exception:  # noqa: BLE001 - one failure must not stop the scan
+                log.exception(
+                    "market_monitor.auto_execute_failed", symbol=opportunity.symbol
+                )
+        if self._notify is not None:
+            await self._notify(opportunity)
+
+    async def auto_trading_on(self) -> bool:
+        """Whether automatic execution is currently switched on.
+
+        The setting is only the default: the operator turns it on and off at
+        runtime, and the choice has to survive a restart, so the answer is read
+        from the same place the kill switch lives. Until the operator has made
+        an explicit choice, the configured default stands.
+        """
+        async with self._db.session() as session:
+            stored = await AppStateRepository(session).get(AUTO_TRADING_KEY, None)
+        if stored is None:
+            return bool(self.settings.auto_trading_enabled)
+        return bool(stored)
+
+    async def set_auto_trading(self, enabled: bool) -> bool:
+        """Switch automatic execution on or off and return the new state."""
+        async with self._db.session() as session:
+            await AppStateRepository(session).set(AUTO_TRADING_KEY, bool(enabled))
+        log.warning(
+            "market_monitor.auto_trading_toggled",
+            enabled=bool(enabled),
+            note=(
+                "el bot operara solo"
+                if enabled
+                else "las entradas vuelven a requerir ACEPTAR"
+            ),
+        )
+        return bool(enabled)
 
     async def _mark_scan_time(self) -> None:
         async with self._db.session() as session:

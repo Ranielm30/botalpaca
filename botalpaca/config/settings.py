@@ -213,6 +213,11 @@ class MonitoringSettings(BaseSettings):
     )
 
     auto_trading_enabled: bool = False  # signals never auto-execute by default
+    # Who the automatic execution is attributed to. The allowlist holds Telegram
+    # ids, and one of them can be the bot's own id -- which Telegram refuses as a
+    # message target -- so the operator id cannot be inferred. Without it, an
+    # automatic execution has no user to be allowed for, and it is refused.
+    auto_trading_user_id: int | None = None
     position_alert_cooldown_seconds: int = Field(default=900, ge=0)
     signal_alert_cooldown_seconds: int = Field(default=1800, ge=0)
     # This gate runs AFTER the scanner, so setting it above the confluence

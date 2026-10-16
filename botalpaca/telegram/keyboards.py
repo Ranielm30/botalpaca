@@ -34,6 +34,7 @@ REPLACE_ORDER = "modificar"
 RISK_DETAIL = "riesgo"
 STATS_DETAIL = "stats"
 CONFIRM_ENV = "confirmar_modo"
+CONFIRM_AUTO = "confirmar_auto"
 HELP = "ayuda"
 POSITION_MENU = "pos_menu"
 ADD_POSITION = "ampliar"
@@ -57,6 +58,19 @@ def mode_button(environment: TradingEnvironment) -> InlineKeyboardButton:
 
 def mode_keyboard(environment: TradingEnvironment) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[mode_button(environment)]])
+
+
+def auto_button(enabled: bool) -> InlineKeyboardButton:
+    label = (
+        "🔴 DESACTIVAR MODO AUTOMÁTICO"
+        if enabled
+        else "🟢 ACTIVAR MODO AUTOMÁTICO"
+    )
+    return InlineKeyboardButton(label, callback_data=f"{CONFIRM_AUTO}:{1 if enabled else 0}")
+
+
+def auto_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[auto_button(enabled)]])
 
 
 def signal_keyboard(symbol: str) -> InlineKeyboardMarkup:

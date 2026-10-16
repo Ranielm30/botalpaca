@@ -36,6 +36,7 @@ class ConfirmationKind(StrEnum):
     TRAILING = "trailing"
     BREAK_EVEN = "break_even"
     PROGRESSIVE = "progressive"
+    AUTO = "auto"
 
 
 @dataclass

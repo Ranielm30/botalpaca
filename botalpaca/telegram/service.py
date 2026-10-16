@@ -364,6 +364,93 @@ class TelegramFacade:
 
     # -------------------------------------------------------------- análisis
 
+    async def auto(self, update: object, args: str | None = None) -> CommandResult:
+        """Show the automatic-execution state, or stage an explicit change.
+
+        `/auto` alone reads. `/auto on` / `/auto off` ask for confirmation, the
+        same way `/modo` does: flipping a switch that moves money needs a second
+        explicit step, and the button carries it.
+        """
+        await self.authorize(update)
+
+        if args:
+            wanted = args.strip().lower()
+            if wanted in {"on", "si", "sí", "activar", "1"}:
+                return await self._stage_auto(update, True)
+            if wanted in {"off", "no", "desactivar", "0"}:
+                return await self._stage_auto(update, False)
+            raise CommandError("Uso: <code>/auto</code>, <code>/auto on</code> o <code>/auto off</code>")
+
+        return await self._auto_card()
+
+    async def _auto_card(self) -> CommandResult:
+        from botalpaca.telegram.keyboards import auto_keyboard
+
+        enabled = await self.app.active.market_monitor.auto_trading_on()
+        if enabled:
+            headline = "🤖 Modo automático: ACTIVADO"
+            note = (
+                "El bot opera solo. Cada entrada se ejecuta con las mismas "
+                "puertas que una confirmada a mano y se anuncia en Telegram."
+            )
+        else:
+            headline = "🖐 Modo automático: DESACTIVADO"
+            note = "Cada entrada sigue pidiendo tu ACEPTAR."
+        operator = self.app.settings.monitoring.auto_trading_user_id
+        text = "\n".join([headline, "", note])
+        if operator is None:
+            text += (
+                "\n\n⚠️ Sin <code>MONITORING_AUTO_TRADING_USER_ID</code> configurado "
+                "no se puede activar: no hay un operador al que atribuir las órdenes."
+            )
+        return CommandResult(text, auto_keyboard(enabled))
+
+    async def _stage_auto(self, update: object, enabled: bool) -> CommandResult:
+        from botalpaca.telegram.keyboards import auto_keyboard
+
+        if enabled and self.app.settings.monitoring.auto_trading_user_id is None:
+            raise CommandError(
+                "Falta configurar MONITORING_AUTO_TRADING_USER_ID: sin un operador "
+                "al que atribuir las órdenes, el modo automático no puede activarse."
+            )
+        user_id = _user_id(update) or 0
+        await self.app.confirmations.request(
+            kind=ConfirmationKind.AUTO,
+            user_id=user_id,
+            environment=self.environment,
+            summary="Activar el modo automático" if enabled else "Desactivar el modo automático",
+            details={"enabled": enabled},
+        )
+        if enabled:
+            body = (
+                "🤖 <b>Vas a activar el modo automático</b>\n"
+                "El bot abrirá posiciones solo, sin pedir ACEPTAR.\n"
+                "Sigue respetando el kill switch, los límites de riesgo y la "
+                "validación de niveles.\n\n¿Confirmas?"
+            )
+        else:
+            body = (
+                "🖐 <b>Vas a desactivar el modo automático</b>\n"
+                "Las entradas vuelven a requerir tu ACEPTAR.\n\n¿Confirmas?"
+            )
+        return CommandResult(body, auto_keyboard(enabled))
+
+    async def confirm_auto(self, update: object, enabled: bool) -> CommandResult:
+        """Executed only after an explicit confirmation."""
+        user_id = _user_id(update) or 0
+        pending = await self.app.confirmations.consume(
+            user_id=user_id, kind=ConfirmationKind.AUTO
+        )
+        if pending is None or bool(pending.details.get("enabled")) is not enabled:
+            raise CommandError("No hay ninguna confirmación de modo automático pendiente.")
+        self.app.security.allowlist.require(user_id)
+        now_on = await self.app.active.market_monitor.set_auto_trading(enabled)
+        return CommandResult(
+            "🤖 Modo automático ACTIVADO. El bot operará solo."
+            if now_on
+            else "🖐 Modo automático DESACTIVADO. Cada entrada pedirá tu ACEPTAR."
+        )
+
     async def analizar(self, update: object, args: str | None = None) -> CommandResult:
         await self.authorize(update)
         symbols = parse_symbol_list(args)
