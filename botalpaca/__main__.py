@@ -108,10 +108,6 @@ async def _run(settings: Settings) -> int:
 
     scheduler = Scheduler(app)
 
-    # Recovery: reconcile SQLite against Alpaca before anything else runs, so a
-    # restart never leaves a position unprotected.
-    await scheduler.run_pending()
-
     await bot_app.initialize()
     # CRITICAL: python-telegram-bot >= 21 deliberately does NOT fetch updates in
     # `Application.start()`; the updater must be started explicitly (or via
@@ -121,6 +117,19 @@ async def _run(settings: Settings) -> int:
     # Publish the command list so typing "/" suggests every command.
     await publish_commands(bot_app.bot)
     await bot_app.start()
+
+    # Recovery: reconcile SQLite against Alpaca before the scheduled jobs take
+    # over, so a restart never leaves a position unprotected for long.
+    #
+    # Deliberately AFTER Telegram is live. Reconciliation retries a broker
+    # rejection with a growing backoff, and a position whose shares its own stop
+    # is holding can make that retry endless. Blocking the boot on it produced
+    # the worst failure mode available: the process was up, connected to Alpaca,
+    # reconciling every five minutes, and completely mute -- nobody could even
+    # ask it what state needed recovering. Protection does not depend on this
+    # ordering; the autonomy engine creates emergency stops for naked positions
+    # every cycle, and the reconcile loop runs regardless.
+    await scheduler.run_pending()
     await scheduler.start()
 
     stop_event = asyncio.Event()
