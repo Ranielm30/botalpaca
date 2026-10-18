@@ -371,6 +371,16 @@ class ExecutionEngine:
     ) -> SubmissionResult:
         """Close a position. ``percentage``/``qty`` use Alpaca's string format."""
         self._assert_environment(environment)
+        # A close is still trading, and the kill switch exists so that one
+        # command stops the bot completely. Before this check, entries were
+        # blocked but a timed or autonomous close kept firing, which made the
+        # switch a half-measure. Here rather than in each caller because this is
+        # the single place every close goes through, manual or autonomous.
+        async with self._db.session() as session:
+            if await self._kill_switch_engaged(session):
+                raise KillSwitchError(
+                    "Kill switch is active. All position closes are blocked."
+                )
         if self.require_confirmation and not confirmed:
             raise ConfirmationRequiredError("Closing a position requires confirmation.")
         if qty is None and percentage is None:

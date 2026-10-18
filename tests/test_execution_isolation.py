@@ -194,6 +194,22 @@ async def test_kill_switch_release_restores_trading(database):
     assert len(client.submitted) == 1
 
 
+async def test_kill_switch_blocks_a_close(database):
+    """A close is trading, so the switch has to stop it too, not just entries.
+
+    Before this the switch was a half-measure: submissions were blocked, but a
+    timed or autonomous close still fired, so the bot kept moving money after
+    the operator had asked it to stop. This is the one place every close goes
+    through, manual or autonomous.
+    """
+    engine, client = await _engine(database)
+    async with database.session() as session:
+        await AppStateRepository(session).set(KILL_SWITCH_KEY, True)
+    with pytest.raises(KillSwitchError):
+        await engine.close_position("AAPL", environment=TradingEnvironment.PAPER)
+    assert not client.submitted
+
+
 # -- order lifecycle -----------------------------------------------------------------
 async def test_cancel_order(database):
     engine, client = await _engine(database)
