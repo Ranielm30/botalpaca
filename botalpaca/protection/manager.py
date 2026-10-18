@@ -1513,15 +1513,6 @@ class PositionProtectionManager:
             environment=environment, position=position, buffer_pct=buffer
         )
 
-    async def check_momentum_exit(
-        self, *, environment: TradingEnvironment, position: PositionSnapshot, momentum_score: float
-    ) -> bool:
-        """True when a momentum-loss exit rule has been configured and triggered."""
-        s = self._settings
-        if not s.momentum_exit_enabled:
-            return False
-        return momentum_score < s.momentum_score_threshold
-
     # --------------------------------------------------------------- time stop
 
     async def time_stop_deadline(

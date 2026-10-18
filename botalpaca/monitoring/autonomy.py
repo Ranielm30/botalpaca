@@ -140,11 +140,18 @@ class AutonomousProtector:
 
     # -- rules ---------------------------------------------------------------
 
-    async def evaluate(self, position: PositionSnapshot) -> list[AutonomyReport]:
+    async def evaluate(
+        self, position: PositionSnapshot, *, score_drop: float | None = None
+    ) -> list[AutonomyReport]:
         """Run every enabled rule for one position.
 
         Rules are ordered from cheapest and safest to most involved, and at most
         one state-changing rule fires per pass so the report stays readable.
+
+        ``score_drop`` is how far the setup's score has fallen since the position
+        was opened, in points. It arrives from the monitor, which computes it
+        while re-analysing the symbol; ``None`` means nobody measured it, and the
+        momentum rule must not fire on a missing number.
         """
         reports: list[AutonomyReport] = []
         if position.qty == 0:
@@ -163,7 +170,27 @@ class AutonomousProtector:
             reports.extend(await self._ensure_stop(position, state))
             return reports
 
-        # 2. Time stop: the trade has had its window and has not delivered.
+        # 2. A setup whose score has collapsed since entry is no longer the setup
+        # that was approved. This is a decision about the thesis, not about price:
+        # the levels can still be intact and the trade still be in profit while
+        # the reason for being in it is gone. It runs before the price-based
+        # rules because a deteriorating setup should not get the chance to earn
+        # its way back to a trailing stop first.
+        if (
+            self.settings.auto_momentum_exit
+            and score_drop is not None
+            and score_drop >= self.settings.momentum_exit_score_drop
+        ):
+            closed = await self._close(
+                position,
+                AutonomyAction.MOMENTUM_EXIT,
+                f"el score cayo {score_drop:.0f} puntos desde la entrada",
+            )
+            if closed is not None:
+                reports.append(closed)
+            return reports
+
+        # 3. Time stop: the trade has had its window and has not delivered.
         if self.settings.auto_time_stop and await self._protection.is_time_stop_due(
             self.environment, position.symbol
         ):
@@ -172,7 +199,7 @@ class AutonomousProtector:
                 reports.append(closed)
             return reports
 
-        # 3. Once the trailing stop owns the position there is nothing left to
+        # 4. Once the trailing stop owns the position there is nothing left to
         # ratchet: it already follows the price, and a fixed stop on top of it
         # would fight it and cancel the very protection that is running.
         if state.has_trailing:

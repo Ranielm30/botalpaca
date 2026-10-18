@@ -72,6 +72,20 @@ def _trading_days(count: int, *, last: dt.datetime) -> list[SimpleNamespace]:
     return [_raw(d, 100.0 + i) for i, d in enumerate(days)]
 
 
+def _last_trading_day(last: dt.datetime) -> dt.datetime:
+    """The last weekday at or before ``last`` -- what ``_trading_days`` ends on.
+
+    A weekend has no close to end on, so the newest bar that exists is Friday's
+    even when ``last`` is a Saturday. Comparing against ``last`` itself made
+    these tests fail every weekend for a reason that has nothing to do with the
+    market service.
+    """
+    day = last
+    while day.weekday() >= 5:
+        day -= dt.timedelta(days=1)
+    return day
+
+
 @pytest.mark.asyncio
 async def test_the_window_ends_at_the_last_bar_that_exists():
     """The newest bar returned has to be the newest bar available."""
@@ -82,7 +96,7 @@ async def test_the_window_ends_at_the_last_bar_that_exists():
     result = await service.get_bars("AAPL", timeframe="1D", limit=300)
 
     assert len(result) == 300
-    assert result[-1].timestamp.date() == last.date(), (
+    assert result[-1].timestamp.date() == _last_trading_day(last).date(), (
         "el escaner se esta analizando un mercado que ya no existe: "
         f"la ultima vela que recibio es del {result[-1].timestamp.date()}"
     )
@@ -98,7 +112,7 @@ async def test_a_short_window_still_honours_the_limit():
     result = await service.get_bars("AAPL", timeframe="1D", limit=50)
 
     assert len(result) == 50
-    assert result[-1].timestamp.date() == last.date()
+    assert result[-1].timestamp.date() == _last_trading_day(last).date()
     assert result[0].timestamp > bars[-51].timestamp
 
 
@@ -111,7 +125,24 @@ async def test_the_multi_request_behaves_the_same_way():
 
     result = await service.get_bars_multi(["aapl"], timeframe="1D", limit=300)
 
-    assert result["AAPL"][-1].timestamp.date() == last.date()
+    assert result["AAPL"][-1].timestamp.date() == _last_trading_day(last).date()
+
+
+@pytest.mark.asyncio
+async def test_a_weekend_last_day_still_ends_on_the_last_close():
+    """A Saturday has no close of its own, so the newest bar is Friday's.
+
+    The tests used to compare against ``last`` itself, which made them fail
+    every weekend for a reason that had nothing to do with the market service.
+    Pinning a Saturday keeps that from coming back.
+    """
+    saturday = dt.datetime(2026, 10, 17, 5, 0, tzinfo=UTC)
+    bars = _trading_days(300, last=saturday)
+    service, _ = _service(bars)
+
+    result = await service.get_bars("AAPL", timeframe="1D", limit=300)
+
+    assert result[-1].timestamp.date() == dt.date(2026, 10, 16)
 
 
 @pytest.mark.asyncio

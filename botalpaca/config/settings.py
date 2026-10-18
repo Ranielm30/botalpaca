@@ -203,6 +203,15 @@ class ProtectionSettings(BaseSettings):
     opt-in rather than surprising the operator with an automatic close.
     """
 
+    momentum_exit_score_drop: float = Field(default=20.0, ge=0)
+    """Points of score lost since the position was opened that count as a collapse.
+
+    Deliberately the same number `MonitoringSettings.score_drop_alert_threshold`
+    uses to warn: a drop big enough to be worth telling the operator about is the
+    drop that abandons the trade. Two thresholds for one concept would let the
+    alert fire while the exit silently ignores the same move.
+    """
+
     # Notification cooldown, so a long losing trade does not spam every minute.
     autonomy_notify_cooldown_minutes: int = Field(default=30, ge=0)
 

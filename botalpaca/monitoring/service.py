@@ -253,6 +253,9 @@ class PositionMonitor:
         self.protection_settings = protection_settings or get_settings().protection
         self._last_alert: dict[str, dt.datetime] = {}
         self._last_autonomy: dict[str, dt.datetime] = {}
+        # Symbol -> score lost since the position was opened. Fed to the
+        # autonomous momentum rule, which is the only consumer.
+        self._score_drops: dict[str, float] = {}
         self._running = False
         self.autonomy = AutonomousProtector(
             protection,
@@ -262,8 +265,16 @@ class PositionMonitor:
         )
 
     async def apply_autonomy(self, position: PositionSnapshot) -> list[AutonomyReport]:
-        """Run the unattended protection rules for one position."""
-        return await self.autonomy.evaluate(position)
+        """Run the unattended protection rules for one position.
+
+        The momentum rule needs the score drop the monitor measured on this
+        symbol, so the last one seen is handed over. It is from the previous
+        cycle -- ``check_all`` runs autonomy before the re-analysis -- which is
+        one 60-second pass of delay and not worth reordering the loop for.
+        """
+        return await self.autonomy.evaluate(
+            position, score_drop=self._score_drops.get(position.symbol.upper())
+        )
 
     @property
     def running(self) -> bool:
@@ -374,6 +385,10 @@ class PositionMonitor:
 
         changes = self._describe_changes(snapshot, position)
         drop = previous - current
+        # The drop is handed to the autonomy rules even when it is not worth an
+        # alert: exiting on a collapse and notifying about one answer different
+        # questions, and must not be gated by the same flag.
+        self._score_drops[position.symbol.upper()] = drop
         triggered = None
         # One gate for the whole alert: the score drop is the signal, the change
         # list is only the explanation. Alerting on changes alone produced noise

@@ -52,10 +52,12 @@ def _state(**kw):
 class _Protection:
     """Records every call the protector makes."""
 
-    def __init__(self, state=None, atr=2.0):
+    def __init__(self, state=None, atr=2.0, _engine=None):
         self.state = state if state is not None else _state()
         self.calls: list[tuple[str, dict]] = []
         self.atr = atr
+        # Stand-in for the execution engine, which is what actually closes.
+        self._engine = _engine
 
     async def state_for_position(self, environment, position):
         return self.state
@@ -147,6 +149,68 @@ async def test_break_even_does_not_repeat_once_applied():
     reports = await protector.evaluate(_Position())
     assert all(r.action != AutonomyAction.BREAK_EVEN for r in reports)
     assert all(call[0] != "move_to_break_even" for call in protection.calls)
+
+
+class _Engine:
+    """Records the closes the protector asks for."""
+
+    def __init__(self) -> None:
+        self.closed: list[tuple[str, bool]] = []
+
+    async def close_position(self, symbol, environment=None, confirmed=False):
+        self.closed.append((symbol, confirmed))
+        return None
+
+
+async def test_a_collapsed_score_closes_the_position():
+    """A setup that stopped being the setup that was approved is abandoned.
+
+    This is a decision about the thesis, not about price: the levels can still
+    be intact and the trade still in profit while the reason for being in it is
+    gone. That is what "the bot decides everything" means here.
+    """
+    engine = _Engine()
+    protection = _Protection(_engine=engine)
+    protector = AutonomousProtector(
+        protection, environment=PAPER, settings=ProtectionSettings(auto_momentum_exit=True)
+    )
+    reports = await protector.evaluate(_Position(), score_drop=25.0)
+    assert [r.action for r in reports] == [AutonomyAction.MOMENTUM_EXIT]
+    assert engine.closed == [("AAPL", True)]
+
+
+async def test_a_collapsed_score_does_not_close_when_the_rule_is_off():
+    engine = _Engine()
+    protection = _Protection(_engine=engine)
+    protector = AutonomousProtector(protection, environment=PAPER)
+    reports = await protector.evaluate(_Position(), score_drop=25.0)
+    assert all(r.action != AutonomyAction.MOMENTUM_EXIT for r in reports)
+    assert engine.closed == []
+
+
+async def test_the_momentum_rule_needs_a_measured_drop():
+    """A missing measurement must not read as a collapse."""
+    engine = _Engine()
+    protection = _Protection(_engine=engine)
+    protector = AutonomousProtector(
+        protection, environment=PAPER, settings=ProtectionSettings(auto_momentum_exit=True)
+    )
+    reports = await protector.evaluate(_Position(), score_drop=None)
+    assert all(r.action != AutonomyAction.MOMENTUM_EXIT for r in reports)
+    assert engine.closed == []
+
+
+async def test_the_momentum_rule_respects_its_threshold():
+    engine = _Engine()
+    protection = _Protection(_engine=engine)
+    protector = AutonomousProtector(
+        protection,
+        environment=PAPER,
+        settings=ProtectionSettings(auto_momentum_exit=True, momentum_exit_score_drop=20.0),
+    )
+    reports = await protector.evaluate(_Position(), score_drop=19.0)
+    assert all(r.action != AutonomyAction.MOMENTUM_EXIT for r in reports)
+    assert engine.closed == []
 
 
 async def test_trailing_arms_after_its_trigger():
