@@ -108,6 +108,29 @@ def _classify_exit(fills: list[_ExitFill], row: TradeModel) -> tuple[str, str]:
         return "TARGET", "Orden límite de salida llenada en Alpaca"
     return "MANUAL", "Cierre manual en Alpaca"
 
+
+def _opened_too_recently(row: TradeModel, grace_seconds: float) -> bool:
+    """Whether ``row`` is young enough that its absence from the broker proves nothing.
+
+    The snapshot is read a heartbeat before settlement runs, so a trade opened
+    inside that heartbeat is missing for the wrong reason; the next cycle
+    judges it with a view that has caught up. SQLite hands back naive
+    timestamps even though the column carries a timezone, so the instant is
+    normalised before it is subtracted -- the way ``_exit_fills`` does -- to
+    keep the comparison from raising on a naive/aware mix. A row with no
+    opening time cannot be judged by age and is left to the rest of the pass.
+    """
+    if grace_seconds <= 0:
+        return False
+    opened_at = getattr(row, "opened_at", None)
+    if opened_at is None:
+        return False
+    if opened_at.tzinfo is None:
+        opened_at = opened_at.replace(tzinfo=dt.UTC)
+    age = (dt.datetime.now(dt.UTC) - opened_at).total_seconds()
+    return age < grace_seconds
+
+
 #: Callback used to push a rendered message plus an optional Telegram keyboard.
 Sender = Callable[[str, object], Awaitable[None]]
 
@@ -850,6 +873,11 @@ class Application:
             positions=positions,
             protect_missing=self.settings.protection.auto_protect_missing_stop,
         )
+        # Protecting positions takes seconds, and an entry filled while that
+        # ran is missing from the snapshot above. Settling against it would
+        # close a trade the broker is actually holding, so the view the ledger
+        # is judged against has to be at least as fresh as the pass that reads it.
+        positions = await self.portfolio.get_positions()
         notes.extend(await self._settle_finished_trades(environment, positions))
         log.info("app.reconciled", environment=environment.value, notes=len(notes))
         await self._notify_reconciliation(environment, notes)
@@ -858,7 +886,11 @@ class Application:
     # ------------------------------------------------------------ settling the ledger
 
     async def _settle_finished_trades(
-        self, environment: TradingEnvironment, positions: list[PositionSnapshot]
+        self,
+        environment: TradingEnvironment,
+        positions: list[PositionSnapshot],
+        *,
+        grace_seconds: float = 120.0,
     ) -> list[str]:
         """Close ledger rows for trades the broker has already finished.
 
@@ -868,6 +900,11 @@ class Application:
         on counting as open risk, kept its capital reserved, and never reached
         the statistics. Reconciliation is already the one place that compares
         SQLite against Alpaca, so the settlement belongs here.
+
+        ``grace_seconds`` keeps rows opened moments ago out of the pass. The
+        broker snapshot is always read a heartbeat before this runs, so a trade
+        that opened inside that heartbeat looks absent for the wrong reason;
+        the next cycle, minutes later, judges it with a view that has caught up.
         """
         live = {p.symbol.upper() for p in positions if p.qty != 0}
         async with self.database.session() as session:
@@ -881,6 +918,13 @@ class Application:
             try:
                 symbol = row.symbol.upper()
                 if symbol in live:
+                    continue
+                if _opened_too_recently(row, grace_seconds):
+                    log.info(
+                        "app.settle_deferred",
+                        symbol=symbol,
+                        note="entrada reciente: se asienta en el proximo ciclo",
+                    )
                     continue
                 note = await self._settle_trade(environment, row)
             except Exception as exc:  # noqa: BLE001 - one row must not stop the rest

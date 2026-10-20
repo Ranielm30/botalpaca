@@ -88,8 +88,16 @@ def _position(symbol: str, qty: float):
     return SimpleNamespace(symbol=symbol, qty=qty)
 
 
-async def _settle(app, positions):
-    return await Application._settle_finished_trades(app, PAPER, positions)
+async def _settle(app, positions, *, grace_seconds=0.0):
+    """Drive the real settlement pass.
+
+    The grace starts at zero because ``open_trade`` stamps rows with now, so
+    every fixture row would be young enough to defer; these cases are about how
+    a settled trade is judged, and freshness itself has its own test.
+    """
+    return await Application._settle_finished_trades(
+        app, PAPER, positions, grace_seconds=grace_seconds
+    )
 
 
 async def _open(journal, *, symbol="AAPL", direction=SignalDirection.LONG, **over):
@@ -441,3 +449,69 @@ async def test_settling_twice_does_not_double_count(database):
     assert len(first) == 1
     assert second == []
     assert len([r for r in after_first if r.status == "CLOSED"]) == 1
+
+
+# ------------------------------------------------------------------- freshness
+async def test_a_trade_opened_moments_ago_is_left_for_the_next_cycle(database):
+    """A snapshot taken before an entry filled must not close that entry.
+
+    The broker view is read a heartbeat before settlement runs, so a trade
+    opened inside that heartbeat is absent for the wrong reason. The grace
+    leaves it OPEN until a later cycle can judge it with a view that has
+    caught up.
+    """
+    trade = await _open(TradeJournal(database), filled_at=None, stop_order_id="sl-9")
+    app = _App(database, orders=[])
+
+    deferred = await _settle(app, [], grace_seconds=120.0)
+    young = await _row(database, trade.id)
+    settled = await _settle(app, [], grace_seconds=0.0)
+    grown = await _row(database, trade.id)
+
+    assert deferred == []
+    assert young.status == "OPEN"
+    assert "ENTRADA_NO_EJECUTADA" in settled[0]
+    assert grown.status == "CLOSED"
+
+
+async def test_reconciliation_judges_the_ledger_against_a_fresh_snapshot(
+    database, settings, monkeypatch
+):
+    """Settling must not run on the view protection was handed.
+
+    Protection takes a while, and an entry filled during that work is in the
+    ledger but not in the snapshot of the first read. Reconciliation reads the
+    positions again, so the row is seen as live instead of being closed as a
+    trade the broker never had. The freshness grace is switched off here so the
+    snapshot alone decides.
+    """
+    from types import SimpleNamespace
+
+    from botalpaca.app import Application
+
+    import botalpaca.app as app_module
+
+    monkeypatch.setattr(app_module, "_opened_too_recently", lambda row, seconds: False)
+    app = Application(settings, database=database)
+    environment = app.settings.active_trading_environment
+    trade = await _open(TradeJournal(database), symbol="AAPL")
+    reads = {"n": 0}
+
+    class _Protection:
+        async def reconcile(self, **kwargs: object) -> list[str]:
+            return ["ok"]
+
+    class _Portfolio:
+        async def get_positions(self) -> list[object]:
+            reads["n"] += 1
+            # The first view predates the entry; every read after it has it.
+            return [] if reads["n"] == 1 else [_position("AAPL", 10.0)]
+
+    app.active = SimpleNamespace(
+        environment=environment, protection=_Protection(), portfolio=_Portfolio()
+    )
+    await app.reconcile()
+    row = await _row(database, trade.id)
+
+    assert reads["n"] == 2
+    assert row.status == "OPEN"
