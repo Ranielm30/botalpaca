@@ -221,3 +221,80 @@ async def test_a_confirmation_that_never_existed_is_refused():
     facade = TelegramFacade(_AutoApp(operator=12345))
     with pytest.raises(CommandError, match="confirmación"):
         await facade.confirm_auto(_update(), True)
+
+
+# ----------------------------------------------------------------- the buttons
+
+
+def _buttons(keyboard):
+    return [button for row in keyboard.inline_keyboard for button in row]
+
+
+def test_the_confirmation_button_names_the_change_it_confirms():
+    from botalpaca.telegram.keyboards import auto_button
+
+    turning_on = auto_button(True)
+    assert "ACTIVAR" in turning_on.text
+    assert "DESACTIVAR" not in turning_on.text
+    assert turning_on.callback_data == "confirmar_auto:1"
+
+    turning_off = auto_button(False)
+    assert "DESACTIVAR MODO" in turning_off.text
+    assert turning_off.callback_data == "confirmar_auto:0"
+
+
+async def test_the_plain_auto_card_offers_the_switch_that_stages_it():
+    from botalpaca.telegram.service import TelegramFacade
+
+    app = _AutoApp(operator=12345, enabled=False)
+    facade = TelegramFacade(app)
+    result = await facade.auto(_update())
+
+    # The state card only offers the switch; the staging happens on the press.
+    assert app.confirmations.pending is None
+    (button,) = _buttons(result.keyboard)
+    assert button.callback_data == "cambiar_auto:1"
+    assert "ACTIVAR" in button.text
+
+
+async def test_the_auto_card_offers_the_opposite_of_the_current_state():
+    from botalpaca.telegram.service import TelegramFacade
+
+    app = _AutoApp(operator=12345, enabled=True)
+    facade = TelegramFacade(app)
+    result = await facade.auto(_update())
+
+    (button,) = _buttons(result.keyboard)
+    assert button.callback_data == "cambiar_auto:0"
+    assert "DESACTIVAR" in button.text
+
+
+async def test_pressing_the_switch_button_runs_the_whole_two_step_flow():
+    from botalpaca.telegram.service import TelegramFacade
+
+    app = _AutoApp(operator=12345, enabled=False)
+    facade = TelegramFacade(app)
+
+    card = await facade.auto(_update())
+    (button,) = _buttons(card.keyboard)
+    _, _, payload = button.callback_data.partition(":")
+    staged = await facade.auto(_update(), "on" if payload == "1" else "off")
+    assert "¿Confirmas?" in staged.text
+
+    (confirm,) = _buttons(staged.keyboard)
+    assert confirm.callback_data == "confirmar_auto:1"
+    applied = await facade.confirm_auto(_update(), confirm.callback_data == "confirmar_auto:1")
+    assert "ACTIVADO" in applied.text
+    assert app.active.market_monitor.enabled is True
+
+
+async def test_the_switch_button_is_routed_to_the_auto_command():
+    from botalpaca.telegram import bot as telegram_bot
+    from botalpaca.telegram.service import TelegramFacade
+
+    app = _AutoApp(operator=12345, enabled=False)
+    facade = TelegramFacade(app)
+    result = await telegram_bot._route(_update(), "cambiar_auto", "1", facade)
+
+    assert app.confirmations.pending is not None
+    assert "¿Confirmas?" in result.text

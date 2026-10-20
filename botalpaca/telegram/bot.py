@@ -250,6 +250,8 @@ async def _route(
         return await facade.modo(update, payload)
     if action == kb.CONFIRM_ENV:
         return await facade.confirm_mode_switch(update, TradingEnvironment(payload))
+    if action == kb.AUTO_SWITCH:
+        return await facade.auto(update, "on" if payload == "1" else "off")
     if action == kb.CONFIRM_AUTO:
         return await facade.confirm_auto(update, payload == "1")
     if action == kb.CONFIRM_TRADE:

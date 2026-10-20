@@ -35,6 +35,7 @@ RISK_DETAIL = "riesgo"
 STATS_DETAIL = "stats"
 CONFIRM_ENV = "confirmar_modo"
 CONFIRM_AUTO = "confirmar_auto"
+AUTO_SWITCH = "cambiar_auto"
 HELP = "ayuda"
 POSITION_MENU = "pos_menu"
 ADD_POSITION = "ampliar"
@@ -61,16 +62,31 @@ def mode_keyboard(environment: TradingEnvironment) -> InlineKeyboardMarkup:
 
 
 def auto_button(enabled: bool) -> InlineKeyboardButton:
+    """The confirmation button: it must name the change it confirms."""
     label = (
-        "🔴 DESACTIVAR MODO AUTOMÁTICO"
+        "🟢 ACTIVAR MODO AUTOMÁTICO"
         if enabled
-        else "🟢 ACTIVAR MODO AUTOMÁTICO"
+        else "🔴 DESACTIVAR MODO AUTOMÁTICO"
     )
     return InlineKeyboardButton(label, callback_data=f"{CONFIRM_AUTO}:{1 if enabled else 0}")
 
 
 def auto_keyboard(enabled: bool) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([[auto_button(enabled)]])
+
+
+def auto_switch_button(enabled: bool) -> InlineKeyboardButton:
+    """The switch shown by the plain /auto card: it names the action it takes."""
+    label = (
+        "🟢 ACTIVAR MODO AUTOMÁTICO"
+        if enabled
+        else "🔴 DESACTIVAR MODO AUTOMÁTICO"
+    )
+    return InlineKeyboardButton(label, callback_data=f"{AUTO_SWITCH}:{1 if enabled else 0}")
+
+
+def auto_switch_keyboard(enabled: bool) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[auto_switch_button(enabled)]])
 
 
 def signal_keyboard(symbol: str) -> InlineKeyboardMarkup:

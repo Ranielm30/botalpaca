@@ -384,7 +384,7 @@ class TelegramFacade:
         return await self._auto_card()
 
     async def _auto_card(self) -> CommandResult:
-        from botalpaca.telegram.keyboards import auto_keyboard
+        from botalpaca.telegram.keyboards import auto_switch_keyboard
 
         enabled = await self.app.active.market_monitor.auto_trading_on()
         if enabled:
@@ -403,7 +403,7 @@ class TelegramFacade:
                 "\n\n⚠️ Sin <code>MONITORING_AUTO_TRADING_USER_ID</code> configurado "
                 "no se puede activar: no hay un operador al que atribuir las órdenes."
             )
-        return CommandResult(text, auto_keyboard(enabled))
+        return CommandResult(text, auto_switch_keyboard(not enabled))
 
     async def _stage_auto(self, update: object, enabled: bool) -> CommandResult:
         from botalpaca.telegram.keyboards import auto_keyboard
