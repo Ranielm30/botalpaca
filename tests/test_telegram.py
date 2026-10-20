@@ -929,6 +929,51 @@ async def test_the_history_of_one_symbol_is_looked_up_by_symbol():
     assert "AAPL" in result.text
 
 
+async def test_the_history_renders_the_direction_the_database_stores(database):
+    """`direction` and `status` are plain strings in the ORM, not enums.
+
+    Asking them for `.value` raised AttributeError the first time a symbol
+    actually had history, which is the way `/historial` is typed most of the
+    time. The stub session above returns no trades, so the loop never ran and
+    the crash stayed invisible; a real row is what exposes it.
+    """
+    from botalpaca.db import TradeRepository
+    from botalpaca.db.models import TradeModel
+
+    async with database.session() as session:
+        await TradeRepository(session).create(
+            TradeModel(
+                environment=PAPER.value,
+                symbol="AAPL",
+                direction="LONG",
+                strategy="momentum",
+                setup="breakout",
+                status="CLOSED",
+                entry_price=100.0,
+                exit_price=110.0,
+                qty=10.0,
+                pnl=100.0,
+                pnl_pct=10.0,
+                r_multiple=1.5,
+                opened_at=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+                closed_at=dt.datetime(2024, 1, 2, tzinfo=dt.timezone.utc),
+                exit_reason="target",
+            )
+        )
+
+    app = FakeApp()
+    app.database = database  # the real database, not the empty stub
+    facade = TelegramFacade(app)
+
+    result = await facade.historial(_update(), "AAPL")
+    assert "AAPL" in result.text
+    assert "LONG" in result.text
+
+    result = await facade.historial(_update(), None)
+    assert "LONG" in result.text
+    assert "target" in result.text
+
+
 # --------------------------------------------------------------------------------------
 # helpers that depend on real settings
 # --------------------------------------------------------------------------------------

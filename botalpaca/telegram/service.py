@@ -1548,7 +1548,10 @@ class TelegramFacade:
                 for trade in trades:
                     lines.append(
                         f"• {trade.opened_at:%Y-%m-%d %H:%M} {trade.symbol} "
-                        f"{trade.direction.value} {trade.status.value} · "
+                        # TradeModel keeps direction and status as plain
+                        # strings, so asking them for `.value` crashed here
+                        # the first time a symbol actually had history.
+                        f"{trade.direction} {trade.status} · "
                         f"score {trade.score:.0f} · P&L {money(trade.pnl)} "
                         f"({trade.pnl_pct:+.2f}%) · {trade.r_multiple:+.2f}R · "
                         f"{trade.strategy}"
@@ -1563,7 +1566,7 @@ class TelegramFacade:
                 for trade in trades:
                     lines.append(
                         f"• {trade.closed_at:%Y-%m-%d %H:%M} {trade.symbol} "
-                        f"{trade.direction.value} · {money(trade.pnl)} "
+                        f"{trade.direction} · {money(trade.pnl)} "
                         f"({trade.pnl_pct:+.2f}%) · {trade.r_multiple:+.2f}R · "
                         f"salida: {trade.exit_reason}"
                     )
