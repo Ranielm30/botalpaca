@@ -974,6 +974,54 @@ async def test_the_history_renders_the_direction_the_database_stores(database):
     assert "target" in result.text
 
 
+async def test_the_history_totals_only_the_operations_that_were_traded(database):
+    """The card has to answer "how much am I up?" without any help.
+
+    Entries Alpaca never executed are closed with a zero P&L and the
+    `ENTRADA_NO_EJECUTADA` reason. They are not trades, but they lived in the
+    same table as real ones, so the list counted them and the hit rate came
+    out lower than the book actually was.
+    """
+    from botalpaca.db import TradeRepository
+    from botalpaca.db.models import TradeModel
+
+    def closed(symbol, pnl, reason):
+        return TradeModel(
+            environment=PAPER.value,
+            symbol=symbol,
+            direction="LONG",
+            strategy="momentum",
+            setup="breakout",
+            status="CLOSED",
+            entry_price=100.0,
+            exit_price=100.0 + pnl,
+            qty=10.0,
+            pnl=pnl,
+            pnl_pct=pnl,
+            r_multiple=pnl / 100.0,
+            opened_at=dt.datetime(2024, 1, 1, tzinfo=dt.timezone.utc),
+            closed_at=dt.datetime(2024, 1, 2, tzinfo=dt.timezone.utc),
+            exit_reason=reason,
+        )
+
+    async with database.session() as session:
+        repo = TradeRepository(session)
+        await repo.create(closed("AAPL", 100.0, "target"))
+        await repo.create(closed("MSFT", -50.0, "stop"))
+        # Never executed: closed by the journal, not a trade.
+        await repo.create(closed("NVDA", 0.0, "ENTRADA_NO_EJECUTADA"))
+
+    app = FakeApp()
+    app.database = database  # the real database, not the empty stub
+    result = await TelegramFacade(app).historial(_update(), None)
+
+    assert "P&L <b>+$50.00</b>" in result.text
+    assert "✅ 1 ganancias · ❌ 1 pérdidas · acierto 50%" in result.text
+    assert "2 operaciones" in result.text
+    # The entry that never ran is disclosed, but it is not counted as one.
+    assert "1 entradas no ejecutadas" in result.text
+
+
 # --------------------------------------------------------------------------------------
 # helpers that depend on real settings
 # --------------------------------------------------------------------------------------

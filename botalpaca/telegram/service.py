@@ -1529,47 +1529,92 @@ class TelegramFacade:
         return CommandResult("\n".join(lines))
 
     async def historial(self, update: object, args: str | None = None) -> CommandResult:
+        """Closed operations, plus the total they add up to.
+
+        The command used to answer with a flat list of dense lines and no
+        summary at all, so the one question it is asked most often ("how much
+        am I up?") had to be answered by hand. Entries Alpaca never executed
+        come back from the journal as CLOSED with a zero P&L; they are not
+        trades, so they stay out of the sums and out of the count, and are
+        only noted at the bottom where they belong.
+        """
         await self.authorize(update)
         environment = self.environment
         symbols = parse_symbol_list(args)
-        lines = [
-            f"{env_badge(environment)} <b>Historial · {environment.value}</b>",
-        ]
         from botalpaca.db import TradeRepository
 
+        def signed(value: float | None) -> str:
+            amount = value or 0.0
+            return f"{'+' if amount >= 0 else '-'}${abs(amount):,.2f}"
+
+        def block(closed: list, skipped: int, open_count: int) -> list[str]:
+            out = ["", "<b>Total cerrado</b>"]
+            if not closed:
+                out.append("Sin operaciones cerradas todavía.")
+                return out
+            wins = sum(1 for trade in closed if (trade.pnl or 0.0) > 0)
+            out += [
+                f"P&L <b>{signed(sum((trade.pnl or 0.0) for trade in closed))}</b>"
+                f" · {sum((trade.pnl_pct or 0.0) for trade in closed):+.2f}%",
+                f"✅ {wins} ganancias · ❌ {len(closed) - wins} pérdidas · "
+                f"acierto {wins / len(closed) * 100:.0f}%",
+                f"R acumulado {sum((trade.r_multiple or 0.0) for trade in closed):+.2f}R",
+                f"{len(closed)} operaciones · {open_count} abiertas",
+            ]
+            recent = sorted(
+                closed, key=lambda trade: trade.closed_at or trade.opened_at, reverse=True
+            )[:10]
+            if recent:
+                out.append("")
+                out.append("<b>Últimas 10</b>")
+            for trade in recent:
+                # TradeModel keeps direction as a plain string, so asking it
+                # for `.value` crashed the first time history had a row.
+                out.append(
+                    f"<code>{trade.closed_at:%d-%m %H:%M}</code> "
+                    f"<b>{trade.symbol}</b> · {trade.direction}"
+                )
+                out.append(
+                    f"  {signed(trade.pnl)} · {(trade.pnl_pct or 0.0):+.2f}% · "
+                    f"{(trade.r_multiple or 0.0):+.2f}R · {trade.exit_reason or 'sin motivo'}"
+                )
+            if skipped:
+                out += ["", f"<i>{skipped} entradas no ejecutadas, fuera del cómputo.</i>"]
+            return out
+
+        def live(rows: list) -> tuple[list, int]:
+            counted = [row for row in rows if (row.exit_reason or "") != "ENTRADA_NO_EJECUTADA"]
+            return counted, len(rows) - len(counted)
+
+        lines = [f"{env_badge(environment)} · <b>Historial</b>"]
         async with self.app.database.session() as session:
             repo = TradeRepository(session)
             for symbol in symbols:
-                lines.append("")
-                lines.append(f"<b>{symbol}</b>")
-                trades = await repo.get_all(environment, limit=10, symbol=symbol)
-                if not trades:
-                    lines.append("Sin operaciones registradas.")
-                for trade in trades:
-                    lines.append(
-                        f"• {trade.opened_at:%Y-%m-%d %H:%M} {trade.symbol} "
-                        # TradeModel keeps direction and status as plain
-                        # strings, so asking them for `.value` crashed here
-                        # the first time a symbol actually had history.
-                        f"{trade.direction} {trade.status} · "
-                        f"score {trade.score:.0f} · P&L {money(trade.pnl)} "
-                        f"({trade.pnl_pct:+.2f}%) · {trade.r_multiple:+.2f}R · "
-                        f"{trade.strategy}"
-                    )
+                # The symbol view is the only one that still mixes open and
+                # closed rows, so it reads them in one go and splits by hand.
+                rows = list(await repo.get_all(environment, symbol=symbol, limit=500))
+                if not rows:
+                    lines += ["", f"<b>{symbol}</b>", "Sin operaciones registradas."]
+                    continue
+                counted, skipped = live([row for row in rows if row.status == "CLOSED"])
+                open_count = sum(1 for row in rows if row.status == "OPEN")
+                lines += ["", f"<b>{symbol}</b>"]
+                lines += block(counted, skipped, open_count)
             if not symbols:
                 # `limit` is keyword-only in get_closed; a positional 15 here
                 # raises TypeError, which is why `/historial` with no symbols
                 # (the way it is typed most of the time) never answered.
-                trades = await repo.get_closed(environment, limit=15)
-                if not trades:
-                    lines.append("\nSin operaciones cerradas todavía.")
-                for trade in trades:
-                    lines.append(
-                        f"• {trade.closed_at:%Y-%m-%d %H:%M} {trade.symbol} "
-                        f"{trade.direction} · {money(trade.pnl)} "
-                        f"({trade.pnl_pct:+.2f}%) · {trade.r_multiple:+.2f}R · "
-                        f"salida: {trade.exit_reason}"
-                    )
+                counted, skipped = live(list(await repo.get_closed(environment)))
+                # Counted off `get_all` instead of `count_open`: the open rows
+                # are wanted next to the closed ones anyway, and one query is
+                # cheaper than the aggregate.
+                still_open = sum(
+                    1
+                    for row in await repo.get_all(environment, limit=500)
+                    if row.status == "OPEN"
+                )
+                lines += block(counted, skipped, still_open)
+        lines += ["", "<i>Escribe /historial SIMBOLO para ver una sola.</i>"]
         return CommandResult("\n".join(lines))
 
     async def explicar(self, update: object, args: str | None = None) -> CommandResult:
