@@ -319,8 +319,30 @@ class EnvironmentContext:
 
         # The scan's own snapshot is a scan old by the time this runs, so the
         # symbol is analysed again: the level guards compare against the price
-        # as it is now, not as it was five minutes ago.
-        fresh = await self.app.analyze_symbol(opportunity.symbol)
+        # as it is now, not as it was five minutes ago. That analysis arrives
+        # as a snapshot plus its ranked opportunities, so the entry has to be
+        # lifted back out of the list before it can be planned.
+        outcome = await self.app.analyze_symbol(opportunity.symbol)
+        if outcome is None:
+            log.warning(
+                "app.auto_trading_without_analysis",
+                symbol=opportunity.symbol,
+                note="sin analisis fresco: la entrada no se ejecuta",
+            )
+            return
+        _, candidates = outcome
+        wanted = opportunity.symbol.upper()
+        fresh = next(
+            (candidate for candidate in candidates if candidate.symbol.upper() == wanted),
+            None,
+        )
+        if fresh is None:
+            log.warning(
+                "app.auto_trading_entry_gone",
+                symbol=opportunity.symbol,
+                note="el analisis fresco ya no devuelve esta entrada",
+            )
+            return
         plan, assessment = await self.app.build_plan(fresh)
         try:
             result = await self.app.submit_plan(

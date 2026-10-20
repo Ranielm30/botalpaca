@@ -298,3 +298,92 @@ async def test_the_switch_button_is_routed_to_the_auto_command():
 
     assert app.confirmations.pending is not None
     assert "¿Confirmas?" in result.text
+
+
+# ------------------------------------------------------- the real executor
+def _executor_context(*, fresh, operator=12345):
+    """A minimal Application-shaped stub, wrapped the way the executor sees it.
+
+    ``_auto_execute`` lives on ``EnvironmentContext`` and reaches everything
+    through ``self.app``, so the stub has to keep that indirection honest.
+    """
+    seen: dict[str, object] = {}
+
+    async def _send(text: str, force: bool = False) -> None:
+        seen["sent"] = text
+
+    class _App:
+        async def analyze_symbol(self, symbol):
+            seen["analysed"] = symbol
+            return fresh
+
+        async def build_plan(self, opportunity):
+            seen["planned"] = opportunity
+            plan = SimpleNamespace(
+                symbol=opportunity.symbol,
+                qty=1.0,
+                entry=opportunity.entry,
+                stop_loss=opportunity.stop,
+                take_profit=opportunity.target,
+            )
+            return plan, "assessment"
+
+        async def submit_plan(self, plan, assessment, *, user_id, opportunity):
+            seen["submitted"] = (plan, user_id, opportunity)
+            return SimpleNamespace(order=None)
+
+    app = _App()
+    app.settings = SimpleNamespace(
+        monitoring=SimpleNamespace(auto_trading_user_id=operator)
+    )
+    app.security = SimpleNamespace(allowlist=SimpleNamespace(require=lambda uid: uid))
+    app.notifications = SimpleNamespace(send=_send)
+    return SimpleNamespace(app=app), seen
+
+
+async def test_the_executor_plans_the_fresh_entry_and_not_the_whole_analysis():
+    """A re-analysis arrives as a snapshot plus its opportunities.
+
+    The executor used to hand that pair straight to the risk engine, which
+    died on `'tuple' object has no attribute 'environment'`, so every
+    automatic entry was refused before a single gate had a chance to run.
+    """
+    from botalpaca.app import EnvironmentContext
+
+    scanned = make_opportunity(symbol="NVDA", score=91.0)
+    fresh = make_opportunity(symbol="NVDA", score=88.0)
+    context, seen = _executor_context(fresh=(object(), [fresh]))
+
+    await EnvironmentContext._auto_execute(context, scanned)
+
+    assert seen["analysed"] == "NVDA"
+    assert seen["planned"] is fresh
+    plan, user_id, submitted_as = seen["submitted"]
+    assert plan.symbol == "NVDA"
+    assert user_id == 12345
+    assert submitted_as is fresh
+    assert "NVDA" in seen["sent"]
+
+
+async def test_the_executor_gives_up_when_the_symbol_cannot_be_analysed():
+    from botalpaca.app import EnvironmentContext
+
+    context, seen = _executor_context(fresh=None)
+
+    await EnvironmentContext._auto_execute(context, make_opportunity(symbol="NVDA"))
+
+    assert "planned" not in seen
+    assert "submitted" not in seen
+
+
+async def test_the_executor_gives_up_when_the_fresh_analysis_dropped_the_entry():
+    from botalpaca.app import EnvironmentContext
+
+    other = make_opportunity(symbol="AMD")
+    context, seen = _executor_context(fresh=(object(), [other]))
+
+    await EnvironmentContext._auto_execute(context, make_opportunity(symbol="NVDA"))
+
+    assert seen["analysed"] == "NVDA"
+    assert "planned" not in seen
+    assert "submitted" not in seen
