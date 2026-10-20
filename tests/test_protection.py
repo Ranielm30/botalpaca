@@ -9,7 +9,7 @@ from alpaca.trading.enums import OrderClass
 
 from botalpaca.db.repositories import ProtectionRepository
 from botalpaca.domain.enums import ProtectionKind, TradingEnvironment
-from botalpaca.domain.errors import ValidationError
+from botalpaca.domain.errors import OrderRejectedByBrokerError, ValidationError
 from botalpaca.execution.client import BrokerError
 from botalpaca.execution.engine import ExecutionEngine
 from botalpaca.protection.manager import PositionProtectionManager, r_multiple_of
@@ -88,6 +88,36 @@ async def test_state_is_isolated_per_environment(database):
     # A REAL client is a different broker account entirely: it has no orders.
     real_manager, _, _ = await _setup(database, [], env=TradingEnvironment.REAL)
     assert (await real_manager.get_state(TradingEnvironment.REAL, "AAPL")).has_stop is False
+
+
+async def test_state_carries_the_frozen_baseline_from_the_ledger(database):
+    """state_for_position publishes the baseline, so get_state has to as well.
+
+    The two doors disagreeing meant R was measured from nothing whenever the
+    caller came through this one, even though the ledger already knew the level.
+    """
+    manager, engine, _ = await _setup(database, [_stop_order("s1", stop=97.0)])
+    position = make_position(symbol="AAPL", entry=100.0, current=102.0)
+
+    await manager.reconcile(environment=PAPER, positions=[position], protect_missing=True)
+    async with database.session() as session:
+        frozen = (await ProtectionRepository(session).get(PAPER, "AAPL")).initial_stop_price
+    assert frozen == pytest.approx(97.0)
+
+    state = await manager.get_state(PAPER, "AAPL")
+    assert state.initial_stop_price == pytest.approx(frozen)
+
+
+async def test_state_falls_back_to_the_live_stop_when_the_baseline_is_absent(database):
+    """Rows written before the baseline existed still name a real level."""
+    manager, engine, _ = await _setup(database, [_stop_order("s1", stop=97.0)])
+    async with database.session() as session:
+        await ProtectionRepository(session).upsert(
+            PAPER, "AAPL", qty=10, entry_price=100.0, stop_order_id="s1", stop_price=97.0
+        )
+
+    state = await manager.get_state(PAPER, "AAPL")
+    assert state.initial_stop_price == pytest.approx(97.0)
 
 
 # -- entry protection registration ---------------------------------------------------
@@ -265,6 +295,82 @@ async def test_arming_a_trail_on_a_short_does_not_loosen_the_stop(database):
     assert row.stop_price == 103.5
 
 
+async def test_arming_a_trail_releases_the_bridge_stop_before_sending_the_trailing(database):
+    """The bridge stop holds every share, so the trailing order never lands.
+
+    Alpaca answers a create made on top of it with "insufficient qty
+    available", naming the order that still reserves the position. Waiting the
+    release out is the only way through: the reservation is asynchronous, so
+    cancelling alone still loses the race.
+    """
+    manager, engine, client = await _setup(database, [_stop_order("s1", stop=100.5)])
+    events: list[tuple[str, str]] = []
+    original_submit = client.submit_order
+    original_cancel = client.cancel_order_by_id
+
+    async def submit(*args, **kwargs):
+        order = await original_submit(*args, **kwargs)
+        events.append(("submit", getattr(order, "id", "")))
+        return order
+
+    async def cancel(*args, **kwargs):
+        events.append(("cancel", args[0] if args else kwargs.get("order_id", "")))
+        return await original_cancel(*args, **kwargs)
+
+    client.submit_order = submit
+    client.cancel_order_by_id = cancel
+
+    state = await manager.enable_trailing_stop(
+        environment=PAPER,
+        position=make_position(entry=100.0, current=102.0),
+        trail_percent=2.0,
+    )
+
+    assert state.has_trailing is True
+    # The old legs go first, the bridge stop stands in for them, and only then
+    # may the trailing order claim the shares.
+    assert events[0] == ("cancel", "s1")
+    submits = [entry for entry in events if entry[0] == "submit"]
+    assert len(submits) == 2
+    bridge_id = submits[0][1]
+    assert bridge_id and bridge_id != "s1"
+    assert events[-1] == ("submit", submits[1][1])
+    assert events.index(("submit", bridge_id)) < events.index(("cancel", bridge_id))
+    assert "s1" in client.cancelled
+    assert bridge_id in client.cancelled
+
+
+async def test_a_failed_trailing_arm_puts_the_bridge_stop_back(database):
+    """Releasing the bridge stop is only safe if it can be laid down again."""
+    manager, engine, client = await _setup(database, [_stop_order("s1", stop=100.5)])
+    attempts = {"n": 0}
+    laid: list[str] = []
+    original_submit = client.submit_order
+
+    async def submit(*args, **kwargs):
+        attempts["n"] += 1
+        if attempts["n"] == 2:
+            raise BrokerError("broker down", status_code=500)
+        order = await original_submit(*args, **kwargs)
+        laid.append(getattr(order, "id", ""))
+        return order
+
+    client.submit_order = submit
+
+    with pytest.raises(OrderRejectedByBrokerError, match="broker down"):
+        await manager.enable_trailing_stop(
+            environment=PAPER,
+            position=make_position(entry=100.0, current=102.0),
+            trail_percent=2.0,
+        )
+
+    # The bridge stood in first, went down for the trailing order, and a real
+    # stop was put back once that arm failed: the position is never bare.
+    assert "s1" in client.cancelled
+    assert len(laid) == 2
+    assert laid[0] in client.cancelled
+
+
 async def test_disable_trailing_stop(database):
 
     manager, engine, client = await _setup(database)
@@ -379,6 +485,48 @@ async def test_reconcile_clears_stale_rows(database):
     await manager.reconcile(environment=PAPER, positions=[])
     async with database.session() as session:
         assert await ProtectionRepository(session).get(PAPER, "AAPL") is None
+
+
+async def test_clearing_protection_releases_the_orders_before_dropping_the_row(database):
+    """A manual close used to leave two SIMPLE orders standing for a dead position.
+
+    clear() only deleted the SQLite row, so reconcile's sweep — which iterates
+    ``stored - live`` — could never see those orders again. They held the shares
+    for ever and refused every new entry on the symbol with "cannot open a long
+    buy while a short sell order is open".
+    """
+    manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0)])
+    await manager.register_entry_protection(
+        environment=PAPER, symbol="AAPL", qty=10, entry_price=100.0, stop_order_id="s1"
+    )
+
+    await manager.clear(PAPER, "AAPL")
+
+    assert "s1" in client.cancelled
+    async with database.session() as session:
+        assert await ProtectionRepository(session).get(PAPER, "AAPL") is None
+
+
+async def test_clearing_protection_keeps_the_row_when_a_cancel_fails(database):
+    """A failed cancel must not orphan the orders: the row is the only handle on them."""
+    manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0)])
+    await manager.register_entry_protection(
+        environment=PAPER, symbol="AAPL", qty=10, entry_price=100.0, stop_order_id="s1"
+    )
+
+    async def refuse(order_id, *args, **kwargs):
+        raise BrokerError("broker down", status_code=500)
+
+    original = client.cancel_order_by_id
+    client.cancel_order_by_id = refuse
+    try:
+        await manager.clear(PAPER, "AAPL")
+    finally:
+        client.cancel_order_by_id = original
+
+    assert "s1" not in client.cancelled
+    async with database.session() as session:
+        assert await ProtectionRepository(session).get(PAPER, "AAPL") is not None
 
 
 async def test_reconcile_never_creates_real_protection_for_paper_positions(database):

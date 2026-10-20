@@ -187,6 +187,9 @@ class PositionProtectionManager:
 
         live.break_even_active = bool(row.break_even_active)
         live.time_stop_at = row.time_stop_at
+        # Falls back to the live stop only for rows registered before the
+        # baseline existed, and only while nothing has moved it yet.
+        live.initial_stop_price = row.initial_stop_price or row.stop_price
         if row.order_class:
             try:
                 live.order_class = OrderClass(row.order_class)
@@ -496,6 +499,32 @@ class PositionProtectionManager:
         return stuck
 
     async def clear(self, environment: TradingEnvironment, symbol: str) -> None:
+        """Drop the ledger row for a symbol that no longer has a position.
+
+        The row is not the only thing holding this position's exits: Alpaca
+        still has the stop and the target, and a leftover sell on a closed long
+        refuses every new entry with "cannot open a long buy while a short sell
+        order is open". Releasing them here is what keeps a manual close from
+        leaving two SIMPLE orders standing for a position that is gone — once
+        the row is deleted, reconcile can never see those orders again.
+        """
+        stuck = False
+        for order in await self._engine.get_live_orders_for_symbol(symbol):
+            try:
+                await self._engine.cancel_order(order.id, environment=environment)
+            except Exception as exc:  # noqa: BLE001 - report it, never hide it
+                stuck = True
+                log.warning(
+                    "protection.clear_cancel_failed",
+                    environment=environment.value,
+                    symbol=symbol.upper(),
+                    order_id=str(order.id),
+                    error=str(exc),
+                )
+        if stuck:
+            # The row has to outlive a failed cancel, or reconcile loses the
+            # only handle it has on those orders forever.
+            return
         async with self._db.session() as session:
             await ProtectionRepository(session).delete(environment, symbol)
         log.info("protection.cleared", environment=environment.value, symbol=symbol.upper())
@@ -1283,20 +1312,50 @@ class PositionProtectionManager:
         note = await self._transition_to_trailing(
             environment=environment, position=position, percent=percent
         )
+        provisional_id: str | None = None
+        provisional_price: float | None = None
         if note:
             state.notes.append(note)
+            # The replacement stop only exists to hold the position for the one
+            # round-trip the hand-over costs. Alpaca still counts its shares as
+            # held, so the trailing order below would be refused outright with
+            # "insufficient qty available", arm nothing, and leave the next pass
+            # to cancel this stop, lay down another provisional, and repeat
+            # forever. Releasing it first, and waiting for the release, is the
+            # documented way to free the shares before a new exit order.
+            held = await self.state_for_position(environment, position)
+            provisional_id = held.stop_order_id
+            # The price comes from the ledger the transition just wrote, not
+            # from the order echo: the rollback has to name the level the
+            # provisional actually sat at, even when the broker answers sparse.
+            async with self._db.session() as session:
+                row = await ProtectionRepository(session).get(environment, position.symbol)
+            provisional_price = row.stop_price if row is not None else None
+            if provisional_id:
+                await self._engine.cancel_order(provisional_id, environment=environment)
+                await self._await_shares_free(environment, position.symbol)
 
-        result = await self._submit_exit(
-            environment=environment,
-            request=OrderBuilder.build_trailing_stop(
+        try:
+            result = await self._submit_exit(
+                environment=environment,
+                request=OrderBuilder.build_trailing_stop(
+                    symbol=position.symbol,
+                    qty=abs(position.qty),
+                    exit_side=position.direction,
+                    trail_percent=percent,
+                ),
                 symbol=position.symbol,
-                qty=abs(position.qty),
-                exit_side=position.direction,
-                trail_percent=percent,
-            ),
-            symbol=position.symbol,
-        )
+            )
+        except Exception:
+            if provisional_id and provisional_price:
+                # The replacement is gone and the arm failed, so the position is
+                # bare. Put a real stop back before the failure reaches the
+                # caller: an upgrade must never cost the protection.
+                await self._restore_stop(environment, position, provisional_price)
+            raise
         if result.order is None or not result.order.id:
+            if provisional_id and provisional_price:
+                await self._restore_stop(environment, position, provisional_price)
             raise ValidationError(f"Alpaca no confirmó el trailing stop de {position.symbol}")
         await self._persist(
             environment,
