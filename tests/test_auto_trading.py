@@ -12,6 +12,7 @@ from types import SimpleNamespace
 import pytest
 
 from botalpaca.domain import TradingEnvironment
+from botalpaca.domain.errors import ValidationError
 from botalpaca.monitoring.service import MarketMonitor
 from botalpaca.telegram.service import CommandError
 from tests.conftest import make_opportunity
@@ -301,11 +302,12 @@ async def test_the_switch_button_is_routed_to_the_auto_command():
 
 
 # ------------------------------------------------------- the real executor
-def _executor_context(*, fresh, operator=12345):
+def _executor_context(*, fresh, operator=12345, plan_error=None):
     """A minimal Application-shaped stub, wrapped the way the executor sees it.
 
     ``_auto_execute`` lives on ``EnvironmentContext`` and reaches everything
     through ``self.app``, so the stub has to keep that indirection honest.
+    ``plan_error`` lets a test stand in for the risk engine refusing to plan.
     """
     seen: dict[str, object] = {}
 
@@ -319,6 +321,8 @@ def _executor_context(*, fresh, operator=12345):
 
         async def build_plan(self, opportunity):
             seen["planned"] = opportunity
+            if plan_error is not None:
+                raise plan_error
             plan = SimpleNamespace(
                 symbol=opportunity.symbol,
                 qty=1.0,
@@ -387,3 +391,25 @@ async def test_the_executor_gives_up_when_the_fresh_analysis_dropped_the_entry()
     assert seen["analysed"] == "NVDA"
     assert "planned" not in seen
     assert "submitted" not in seen
+
+
+async def test_an_entry_the_risk_engine_will_not_plan_is_a_refusal_not_a_crash():
+    """The position ceiling is refused while planning, not while submitting.
+
+    Reporting it as a crash hides the one rejection the operator most needs to
+    hear about, and drops the Telegram notice with it.
+    """
+    from botalpaca.app import EnvironmentContext
+
+    refusal = ValidationError("Maximo de posiciones abiertas alcanzado (10/10)")
+    context, seen = _executor_context(
+        fresh=(object(), [make_opportunity(symbol="PG")]), plan_error=refusal
+    )
+
+    await EnvironmentContext._auto_execute(context, make_opportunity(symbol="PG"))
+
+    assert seen["analysed"] == "PG"
+    assert "submitted" not in seen
+    assert "PG" in seen["sent"]
+    assert "entrada rechazada" in seen["sent"]
+    assert "10/10" in seen["sent"]

@@ -343,19 +343,22 @@ class EnvironmentContext:
                 note="el analisis fresco ya no devuelve esta entrada",
             )
             return
-        plan, assessment = await self.app.build_plan(fresh)
+        # Planning is part of the refusal story too: the risk engine rejects most
+        # entries there (the position ceiling included), and a rejection must be
+        # reported as a refusal, never as a crash in the monitor.
         try:
+            plan, assessment = await self.app.build_plan(fresh)
             result = await self.app.submit_plan(
                 plan, assessment, user_id=operator, opportunity=fresh
             )
         except (ValidationError, BotalpacaError, RuntimeError) as exc:
             log.warning(
                 "app.auto_trading_refused",
-                symbol=plan.symbol,
+                symbol=fresh.symbol,
                 error=readable_reason(exc),
             )
             await self.app.notifications.send(
-                f"🤖 [AUTO] {plan.symbol}: entrada rechazada — {readable_reason(exc)}",
+                f"🤖 [AUTO] {fresh.symbol}: entrada rechazada — {readable_reason(exc)}",
                 force=True,
             )
             return
