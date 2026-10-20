@@ -12,7 +12,11 @@ from botalpaca.domain.enums import ProtectionKind, TradingEnvironment
 from botalpaca.domain.errors import OrderRejectedByBrokerError, ValidationError
 from botalpaca.execution.client import BrokerError
 from botalpaca.execution.engine import ExecutionEngine
-from botalpaca.protection.manager import PositionProtectionManager, r_multiple_of
+from botalpaca.protection.manager import (
+    PositionProtectionManager,
+    _blocking_limit_order,
+    r_multiple_of,
+)
 
 from .conftest import FakeTradingClient, fake_order_raw, make_position
 
@@ -1006,3 +1010,114 @@ async def test_a_group_that_fails_leaves_the_stop_back_in_place(database, monkey
     assert row.stop_price == 97.0
     # Nothing is protecting the upside now, so the ledger must stop saying so.
     assert row.take_profit_order_id is None
+
+
+# -- a leftover limit on the other side that blocks every exit ----------------------
+def _wash_trade_refusal(order_id: str) -> BrokerError:
+    """The refusal Alpaca sends while a naked limit lives on the opposite side."""
+    return BrokerError(
+        'Alpaca rejected the request: {"code":40310000,'
+        f'"existing_order_id":"{order_id}",'
+        '"message":"potential wash trade detected. use complex orders",'
+        '"reject_reason":"opposite side limit order exists. '
+        'use complex/limit/stop_limit orders"}',
+        status_code=403,
+    )
+
+
+def _refuse_once(client, error: Exception) -> None:
+    """Fail the next submission like Alpaca, and only the next one."""
+    original = client.submit_order
+    pending = [error]
+
+    async def submit(request):
+        if pending:
+            raise pending.pop()
+        return await original(request)
+
+    client.submit_order = submit
+
+
+async def _skip_share_wait(monkeypatch, manager) -> None:
+    """The blocking order is open by design here, so the release wait would spin."""
+
+    async def _instant(*args, **kwargs):
+        return True
+
+    monkeypatch.setattr(manager, "_await_shares_free", _instant)
+
+
+def test_the_blocking_order_id_is_read_off_the_refusal():
+    assert (
+        _blocking_limit_order(_wash_trade_refusal("4f04b5eb-cbdb-4593-acb7"))
+        == "4f04b5eb-cbdb-4593-acb7"
+    )
+    assert _blocking_limit_order(BrokerError("not enough buying power", status_code=403)) is None
+
+
+async def test_a_stop_refused_for_a_wash_trade_takes_that_limit_down(database, monkeypatch):
+    """The shape PLTR was stuck in: a short with a leftover sell limit."""
+    blocker = fake_order_raw(
+        "blk-1", symbol="PLTR", order_type="limit", side="sell", limit_price=222.08, status="new"
+    )
+    manager, _, client = await _setup(database, [blocker])
+    _refuse_once(client, _wash_trade_refusal("blk-1"))
+    await _skip_share_wait(monkeypatch, manager)
+
+    state = await manager.ensure_stop(
+        environment=PAPER,
+        position=make_position(symbol="PLTR", qty=-35.0, entry=195.88, current=196.5),
+        stop_price=199.0,
+    )
+
+    assert state.has_stop is True
+    assert state.stop_order_id
+    assert client.cancelled == ["blk-1"]
+    assert client.orders["blk-1"].status == "canceled"
+
+
+async def test_a_target_refused_for_a_wash_trade_takes_that_limit_down(database, monkeypatch):
+    """The same blocker is what stopped the take-profit from ever landing."""
+    blocker = fake_order_raw(
+        "blk-3", symbol="PLTR", order_type="limit", side="sell", limit_price=222.08, status="new"
+    )
+    manager, _, client = await _setup(database, [blocker])
+    _refuse_once(client, _wash_trade_refusal("blk-3"))
+    await _skip_share_wait(monkeypatch, manager)
+
+    state = await manager.ensure_take_profit(
+        environment=PAPER,
+        position=make_position(symbol="PLTR", qty=-35.0, entry=195.88, current=196.5),
+        target_price=185.0,
+    )
+
+    assert state.has_take_profit is True
+    assert state.take_profit_order_id
+    assert client.cancelled == ["blk-3"]
+
+
+async def test_a_refusal_that_is_not_a_wash_trade_touches_no_order(database, monkeypatch):
+    """Only Alpaca pointing at a specific order earns the right to cancel it."""
+    blocker = fake_order_raw(
+        "blk-2", symbol="AAPL", order_type="limit", side="buy", limit_price=95.0, status="new"
+    )
+    manager, _, client = await _setup(database, [blocker])
+    _refuse_once(
+        client,
+        BrokerError(
+            'Alpaca rejected the request: {"code":40310001,'
+            '"message":"not enough buying power to place this order"}',
+            status_code=403,
+        ),
+    )
+    await _skip_share_wait(monkeypatch, manager)
+
+    with pytest.raises(ValidationError):
+        await manager.ensure_stop(
+            environment=PAPER,
+            position=make_position(symbol="AAPL", entry=100.0, current=102.0),
+            stop_price=97.0,
+        )
+
+    assert client.cancelled == []
+    assert client.orders["blk-2"].status == "new"

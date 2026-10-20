@@ -116,6 +116,34 @@ def _is_inert(order: OrderState, *, protected_ids: set[str] | None = None) -> bo
     return order_status_value(order) in _INERT_STATUSES
 
 
+def _blocking_limit_order(error: object) -> str | None:
+    """The open order Alpaca blames for refusing a protective exit.
+
+    ``40310000 potential wash trade detected ... opposite side limit order
+    exists`` means a naked limit sits on the other side of the symbol, so Alpaca
+    will not take a bare stop or limit while it is open. The refusal carries the
+    id of that order; without it the position stays naked and every later cycle
+    repeats the same dead end.
+    """
+    text = str(error)
+    if "opposite side limit order exists" not in text:
+        return None
+    marker = '"existing_order_id"'
+    at = text.find(marker)
+    if at < 0:
+        return None
+    colon = text.find(":", at + len(marker))
+    if colon < 0:
+        return None
+    opening = text.find('"', colon)
+    if opening < 0:
+        return None
+    closing = text.find('"', opening + 1)
+    if closing <= opening:
+        return None
+    return text[opening + 1 : closing] or None
+
+
 
 # Alpaca answers in raw broker JSON. Dumping that into an operator's chat is
 # unreadable and leaks internals that mean nothing outside the log, so each
@@ -137,6 +165,11 @@ _REASONS: tuple[tuple[str, str], ...] = (
     (
         "not enough buying power",
         "no hay poder de compra suficiente para esa orden",
+    ),
+    (
+        "opposite side limit order exists",
+        "hay una orden limitada viva del lado contrario del simbolo y Alpaca "
+        "no deja colocar esta salida mientras exista",
     ),
 )
 
@@ -432,6 +465,97 @@ class PositionProtectionManager:
             if attempt < attempts - 1:
                 await asyncio.sleep(min(delay * (1.5 ** attempt), 2.5))
         return False
+
+    async def _drop_blocking_limit(
+        self,
+        environment: TradingEnvironment,
+        symbol: str,
+        order_id: str,
+    ) -> bool:
+        """Retire the open order Alpaca blames for refusing a protective exit.
+
+        The order named in ``existing_order_id`` protects nothing in the
+        position it is blocking -- it is a leftover from the book's previous
+        direction -- so the only way to arm the position is to take it down
+        first. ``pending cancel`` counts as success: Alpaca already accepted the
+        cancel and is only working through it.
+        """
+        try:
+            await self._engine.cancel_order(order_id, environment=environment)
+        except Exception as exc:  # noqa: BLE001 - a second cancel is not a failure
+            if "pending cancel" not in str(exc).lower():
+                log.warning(
+                    "protection.blocking_cancel_failed",
+                    environment=environment.value,
+                    symbol=symbol,
+                    order_id=order_id,
+                    error=str(exc),
+                )
+                return False
+        # Accepting a cancel is not completing one: Alpaca keeps answering
+        # "wash trade" for as long as the order is still open, so resubmitting
+        # straight away lands in the very same refusal.
+        for attempt in range(20):
+            try:
+                orders = await self._engine.get_live_orders_for_symbol(symbol)
+            except (BotalpacaError, BrokerError, RuntimeError) as exc:
+                log.warning(
+                    "protection.blocking_probe_failed",
+                    environment=environment.value,
+                    symbol=symbol,
+                    order_id=order_id,
+                    error=str(exc),
+                )
+            else:
+                if not any(str(o.id) == str(order_id) for o in orders):
+                    log.info(
+                        "protection.blocking_limit_cleared",
+                        environment=environment.value,
+                        symbol=symbol,
+                        order_id=order_id,
+                        waited_s=round(attempt * 0.5, 1),
+                    )
+                    return True
+            await asyncio.sleep(0.5)
+        log.warning(
+            "protection.blocking_cancel_stuck",
+            environment=environment.value,
+            symbol=symbol,
+            order_id=order_id,
+        )
+        return False
+
+    async def _submit_protective(
+        self,
+        environment: TradingEnvironment,
+        position: PositionSnapshot,
+        request: object,
+    ):
+        """Send one protective exit, clearing the order Alpaca names as the blocker.
+
+        A bare stop or limit is refused outright while another naked order sits
+        on the opposite side of the symbol, and that refusal is the only reason
+        this ever runs: nothing here cancels an order the broker did not point
+        at. Anything that is not that refusal -- including a second wash-trade
+        answer -- propagates unchanged so the caller reports it as before.
+        """
+        try:
+            return await self._submit_exit(
+                environment=environment,
+                request=request,
+                symbol=position.symbol,
+            )
+        except (BotalpacaError, BrokerError, RuntimeError) as exc:
+            blocking = _blocking_limit_order(exc)
+            if blocking is None or not await self._drop_blocking_limit(
+                environment, position.symbol, blocking
+            ):
+                raise
+        return await self._submit_exit(
+            environment=environment,
+            request=request,
+            symbol=position.symbol,
+        )
 
     async def _clear_inert_orders(
         self,
@@ -795,15 +919,15 @@ class PositionProtectionManager:
         # position, not as a raw exception. An unprotected position is the one
         # outcome they have to act on, so the wording says so plainly.
         try:
-            result = await self._submit_exit(
-                environment=environment,
-                request=OrderBuilder.build_protective_stop(
+            result = await self._submit_protective(
+                environment,
+                position,
+                OrderBuilder.build_protective_stop(
                     symbol=position.symbol,
                     qty=abs(position.qty),
                     exit_side=position.direction,
                     stop_price=price,
                 ),
-                symbol=position.symbol,
             )
         except (BotalpacaError, BrokerError, RuntimeError) as exc:
             log.error(
@@ -908,15 +1032,15 @@ class PositionProtectionManager:
             environment, position.symbol, ignore=state.inert_order_ids
         )
         try:
-            result = await self._submit_exit(
-                environment=environment,
-                request=OrderBuilder.build_protective_limit(
+            result = await self._submit_protective(
+                environment,
+                position,
+                OrderBuilder.build_protective_limit(
                     symbol=position.symbol,
                     qty=abs(position.qty),
                     exit_side=position.direction,
                     limit_price=target_price,
                 ),
-                symbol=position.symbol,
             )
         except (BotalpacaError, BrokerError, RuntimeError) as exc:
             log.error(
