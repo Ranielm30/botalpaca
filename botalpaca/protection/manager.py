@@ -53,6 +53,22 @@ def _is_trailing(order: OrderState) -> bool:
     return _type_value(order) == "trailing_stop"
 
 
+def _is_day_exit(order: OrderState, exit_side: OrderSide) -> bool:
+    """Whether this is an exit the session will take away at the close.
+
+    Alpaca gives a bracket's legs the time-in-force of the entry that carried
+    them, so every protective exit a plan created inherited ``day``. Anything
+    else -- GTC, or an order still waiting to open the position -- outlives the
+    session and is left alone.
+    """
+    if order.side != exit_side:
+        return False
+    if _type_value(order) not in _STOP_TYPES and _type_value(order) != "limit":
+        return False
+    tif = getattr(order, "time_in_force", None)
+    return str(getattr(tif, "value", tif)).lower() == "day"
+
+
 # Order states that reserve the shares but can never execute.
 # Alpaca keeps counting a cancelled order as held briefly, so the same
 # terminal set the state resolver uses decides when shares are free.
@@ -1798,6 +1814,75 @@ class PositionProtectionManager:
 
     # ---------------------------------------------------------- reconciliation
 
+    async def _retire_day_exits(
+        self,
+        environment: TradingEnvironment,
+        position: PositionSnapshot,
+    ) -> list[str]:
+        """Drop the protective exits the session would take at the close.
+
+        A ``day`` exit dies at 20:00 whatever the position is doing, so the
+        shares spend the close bare until something rebuilds them. Retiring
+        them here, right before this position is judged, lets the very same
+        reconciliation pass put them back as GTC -- ``ensure_take_profit`` for
+        the target and ``ensure_stop`` for the stop, which folds the two into
+        one OCO once the target exists. Doing it one position at a time keeps
+        the window to a single rebuild rather than a whole pass.
+
+        A trailing stop is skipped: trailing is already GTC, and clearing
+        anything next to it would have reconciliation swap it for a fixed stop.
+        The exit side filters out pending entries, which are also ``day``.
+        """
+        symbol = position.symbol.upper()
+        orders = await self._engine.get_live_orders_for_symbol(symbol)
+        exit_side = OrderSide.SELL if position.qty >= 0 else OrderSide.BUY
+        doomed = [
+            str(o.id) for o in orders if _is_day_exit(o, exit_side) and not _is_trailing(o)
+        ]
+        dropped: list[str] = []
+        for order_id in doomed:
+            try:
+                await self._engine.cancel_order(order_id, environment=environment)
+                dropped.append(order_id)
+            except Exception as exc:  # noqa: BLE001 - a group goes down together
+                # Cancelling one leg of a group cancels every other one, so the
+                # rest can report the cancel as already done without anything
+                # having gone wrong.
+                if "pending cancel" in str(exc).lower() or "404" in str(exc):
+                    dropped.append(order_id)
+                    continue
+                log.warning(
+                    "protection.day_exit_cancel_failed",
+                    environment=environment.value,
+                    symbol=symbol,
+                    order_id=order_id,
+                    error=str(exc),
+                )
+        if not dropped:
+            return []
+        # Only the orders still standing count as held: a symbol that keeps
+        # another, longer-lived exit keeps its shares reserved, and waiting for
+        # those to go free would be waiting for a protection that must stay.
+        keep = [
+            str(o.id)
+            for o in orders
+            if str(o.id) not in dropped and not _is_day_exit(o, exit_side)
+        ]
+        if not await self._await_shares_free(environment, symbol, ignore=tuple(keep)):
+            log.warning(
+                "protection.day_exit_shares_still_held",
+                environment=environment.value,
+                symbol=symbol,
+                dropped=len(dropped),
+            )
+        log.info(
+            "protection.day_exits_retired",
+            environment=environment.value,
+            symbol=symbol,
+            dropped=len(dropped),
+        )
+        return dropped
+
     async def reconcile(
         self,
         *,
@@ -1817,6 +1902,17 @@ class PositionProtectionManager:
         live = {p.symbol.upper(): p for p in positions if p.qty != 0}
 
         for symbol, position in sorted(live.items()):
+            # A DAY exit is a promise the session will not keep. Retiring it
+            # while the market is still open means this very pass rebuilds the
+            # same exit as GTC instead of the shares spending the close with
+            # nothing on them.
+            if auto:
+                retired = await self._retire_day_exits(environment, position)
+                if retired:
+                    notes.append(
+                        f"🔁 {symbol}: {len(retired)} salida(s) day retirada(s) "
+                        "para reconstruirlas en GTC"
+                    )
             state = await self.state_for_position(environment, position)
             # An inert order reserves the shares without protecting anything,
             # which locks out every future exit on this position. It can outlive

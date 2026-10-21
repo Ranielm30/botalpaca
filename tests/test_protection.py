@@ -8,7 +8,7 @@ import pytest
 from alpaca.trading.enums import OrderClass
 
 from botalpaca.db.repositories import ProtectionRepository
-from botalpaca.domain.enums import ProtectionKind, TradingEnvironment
+from botalpaca.domain.enums import ProtectionKind, TimeInForce, TradingEnvironment
 from botalpaca.domain.errors import OrderRejectedByBrokerError, ValidationError
 from botalpaca.execution.client import BrokerError
 from botalpaca.execution.engine import ExecutionEngine
@@ -1268,3 +1268,131 @@ async def test_a_refusal_that_is_not_a_wash_trade_touches_no_order(database, mon
 
     assert client.cancelled == []
     assert client.orders["blk-2"].status == "new"
+
+
+# -- exits that die with the session --------------------------------------------------
+
+
+def _day_exit(
+    order_id: str,
+    *,
+    symbol: str = "AAPL",
+    order_type: str = "stop",
+    side: str = "sell",
+    **over: object,
+):
+    return fake_order_raw(
+        order_id,
+        symbol=symbol,
+        order_type=order_type,
+        side=side,
+        time_in_force="day",
+        **over,
+    )
+
+
+async def test_a_day_exit_is_retired_so_the_pass_rebuilds_it_as_gtc(database):
+    # A bracket's legs inherit the time-in-force of the entry that carried them,
+    # so both exits arrive session-scoped and the close takes them.
+    manager, _, client = await _setup(
+        database,
+        [
+            _day_exit("sl-day", stop_price=97.0, status="new"),
+            _day_exit("tp-day", order_type="limit", limit_price=106.0, status="new"),
+        ],
+    )
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="AAPL",
+        qty=10.0,
+        entry_price=100.0,
+        stop_order_id="sl-day",
+        stop_price=97.0,
+        take_profit_order_id="tp-day",
+        take_profit_price=106.0,
+        initial_stop_price=97.0,
+    )
+
+    notes = await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="AAPL", entry=100.0, current=102.0)],
+        protect_missing=True,
+    )
+
+    assert any("day retirada" in note for note in notes), notes
+    assert {"sl-day", "tp-day"} <= set(client.cancelled)
+    assert client.submitted, "the pass has to put protection back"
+    for request in client.submitted:
+        assert getattr(request, "time_in_force", None) == TimeInForce.GTC
+
+
+async def test_a_gtc_exit_is_left_where_it_is(database):
+    manager, _, client = await _setup(
+        database,
+        [
+            _stop_order("sl-gtc"),
+            _tp_order("tp-gtc"),
+        ],
+    )
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="AAPL",
+        qty=10.0,
+        entry_price=100.0,
+        stop_order_id="sl-gtc",
+        stop_price=97.0,
+        take_profit_order_id="tp-gtc",
+        take_profit_price=106.0,
+        initial_stop_price=97.0,
+    )
+
+    notes = await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="AAPL", entry=100.0, current=102.0)],
+        protect_missing=True,
+    )
+
+    assert not any("day retirada" in note for note in notes), notes
+
+
+async def test_a_waiting_entry_is_not_a_day_exit_to_retire(database):
+    # The entry is also a DAY stop, and on the opposite side of the position:
+    # cancelling it would throw away an order that has not opened anything yet.
+    manager, _, client = await _setup(
+        database,
+        [_day_exit("entry-day", side="buy", stop_price=101.0, status="new")],
+    )
+
+    notes = await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="AAPL", entry=100.0, current=102.0)],
+        protect_missing=True,
+    )
+
+    assert not any("day retirada" in note for note in notes), notes
+    assert "entry-day" not in client.cancelled
+
+
+async def test_a_trailing_symbol_keeps_the_exit_it_has(database):
+    manager, _, client = await _setup(
+        database,
+        [
+            fake_order_raw(
+                "trail-1",
+                symbol="AAPL",
+                order_type="trailing_stop",
+                side="sell",
+                status="new",
+                time_in_force="day",
+            )
+        ],
+    )
+
+    notes = await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="AAPL", entry=100.0, current=102.0)],
+        protect_missing=True,
+    )
+
+    assert not any("day retirada" in note for note in notes), notes
+    assert "trail-1" not in client.cancelled

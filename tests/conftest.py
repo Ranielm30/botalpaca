@@ -371,6 +371,7 @@ def fake_order_raw(
     stop_price: float | None = None,
     order_class: str = "simple",
     legs: list[Any] | None = None,
+    time_in_force: str = "gtc",
 ) -> Any:
     from types import SimpleNamespace
 
@@ -399,7 +400,10 @@ def fake_order_raw(
         order_type=order_type,
         type=order_type,
         side=side,
-        time_in_force="day",
+        # The bot sends its exits as GTC, so that is what the fake broker hands
+        # back by default. A test that wants the session-scoped shape -- the
+        # one reconciliation retires -- asks for it.
+        time_in_force=time_in_force,
         limit_price=limit_price,
         stop_price=stop_price,
         status=status,
