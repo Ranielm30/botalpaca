@@ -16,7 +16,7 @@ from __future__ import annotations
 import asyncio
 import datetime as dt
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from botalpaca.analysis import analyze_symbol
 from botalpaca.config.logging import get_logger
@@ -107,6 +107,62 @@ def _classify_exit(fills: list[_ExitFill], row: TradeModel) -> tuple[str, str]:
     if "limit" in kinds:
         return "TARGET", "Orden límite de salida llenada en Alpaca"
     return "MANUAL", "Cierre manual en Alpaca"
+
+
+def _row_opened_key(row: TradeModel) -> tuple[dt.datetime, int]:
+    """Sort key for the lots of one position, oldest first.
+
+    SQLite hands back naive datetimes while the broker hands back aware ones,
+    and comparing the two raises. The normalisation is the same one the
+    settlement uses everywhere else.
+    """
+    opened = row.opened_at
+    if opened is not None and opened.tzinfo is None:
+        opened = opened.replace(tzinfo=dt.UTC)
+    return (opened or dt.datetime.min.replace(tzinfo=dt.UTC), int(row.id or 0))
+
+
+def _distribute_exit_fills(
+    rows: list[TradeModel], fills: list[_ExitFill]
+) -> list[tuple[TradeModel, list[_ExitFill]]]:
+    """Share the exit fills out between the ledger rows of one position.
+
+    One position can be several lots, each with its own row in the ledger, and
+    the broker closes them together: a single sell order for the whole size
+    arrives as one fill. Handing that fill to every row would write the P&L of
+    the whole position into each lot -- three times the truth -- and the sum
+    would never match the broker. The oldest row claims the first shares, the
+    next one the following ones, exactly as the broker matched them.
+    """
+    ordered = sorted(rows, key=_row_opened_key)
+    shares: list[tuple[TradeModel, list[_ExitFill]]] = []
+    index = 0
+    carry = 0.0
+    for row in ordered:
+        try:
+            want = abs(float(row.qty or 0.0))
+        except (TypeError, ValueError):
+            # A row whose size cannot be read claims no share. Settling it is
+            # what reports the damage, and it must not take the other lots of
+            # the same position down with it.
+            want = 0.0
+        taken: list[_ExitFill] = []
+        while want > 1e-9 and index < len(fills):
+            fill = fills[index]
+            available = fill.qty - carry
+            if available <= 1e-9:
+                index += 1
+                carry = 0.0
+                continue
+            take = min(want, available)
+            taken.append(replace(fill, qty=take))
+            want -= take
+            carry += take
+            if carry >= fill.qty - 1e-9:
+                index += 1
+                carry = 0.0
+        shares.append((row, taken))
+    return shares
 
 
 def _opened_too_recently(row: TradeModel, grace_seconds: float) -> bool:
@@ -935,15 +991,22 @@ class Application:
         async with self.database.session() as session:
             rows = list(await TradeRepository(session).get_open_positions(environment))
 
-        notes: list[str] = []
+        # The ledger can hold several rows for one position, one per lot, and
+        # the broker closes them with a single sell order. The exit fills are
+        # therefore read once per position and shared out between the rows,
+        # oldest first, instead of being handed to each of them in full: that
+        # would write the P&L of the whole position into every lot.
+        groups: dict[tuple[str, str], list[TradeModel]] = {}
         for row in rows:
-            # Reading the symbol is inside the guard on purpose: a row this
-            # process cannot even name must not abort the whole cycle and
-            # leave every other finished trade unsettled.
-            try:
-                symbol = row.symbol.upper()
-                if symbol in live:
-                    continue
+            key = (row.symbol.upper(), str(row.direction).upper())
+            groups.setdefault(key, []).append(row)
+
+        notes: list[str] = []
+        for (symbol, direction), group in groups.items():
+            if symbol in live:
+                continue
+            pending: list[TradeModel] = []
+            for row in group:
                 if _opened_too_recently(row, grace_seconds):
                     log.info(
                         "app.settle_deferred",
@@ -951,17 +1014,47 @@ class Application:
                         note="entrada reciente: se asienta en el proximo ciclo",
                     )
                     continue
-                note = await self._settle_trade(environment, row)
-            except Exception as exc:  # noqa: BLE001 - one row must not stop the rest
-                log.exception("app.settle_trade_failed", error=str(exc))
-                notes.append(f"⚠️ {getattr(row, 'symbol', '?')}: no se pudo cerrar en el ledger ({exc})")
+                pending.append(row)
+            if not pending:
                 continue
-            if note is not None:
-                notes.append(note)
+            pending.sort(key=_row_opened_key)
+            try:
+                from alpaca.trading.enums import QueryOrderStatus
+
+                is_long = direction.endswith("LONG")
+                # The window of the lookup belongs to the oldest lot: every
+                # exit of the position happened after it opened.
+                fills = await self._exit_fills(pending[0], is_long, QueryOrderStatus)
+            except Exception as exc:  # noqa: BLE001 - one position must not stop the rest
+                log.exception("app.settle_trade_failed", error=str(exc))
+                notes.append(f"⚠️ {symbol}: no se pudo cerrar en el ledger ({exc})")
+                continue
+            for row, share in _distribute_exit_fills(pending, fills):
+                try:
+                    note = await self._settle_trade(environment, row, share=share)
+                except Exception as exc:  # noqa: BLE001 - one row must not stop the rest
+                    log.exception("app.settle_trade_failed", error=str(exc))
+                    notes.append(
+                        f"⚠️ {getattr(row, 'symbol', '?')}: no se pudo cerrar en el ledger ({exc})"
+                    )
+                    continue
+                if note is not None:
+                    notes.append(note)
         return notes
 
-    async def _settle_trade(self, environment: TradingEnvironment, row: TradeModel) -> str | None:
-        """Settle one trade whose position is gone. Returns a note, or None."""
+    async def _settle_trade(
+        self,
+        environment: TradingEnvironment,
+        row: TradeModel,
+        *,
+        share: list[_ExitFill] | None = None,
+    ) -> str | None:
+        """Settle one trade whose position is gone. Returns a note, or None.
+
+        ``share`` is the part of the exit that belongs to this row when the
+        position was made of several lots. Left out, the row looks its own
+        exit up in Alpaca.
+        """
         from alpaca.trading.enums import QueryOrderStatus
 
         symbol = row.symbol.upper()
@@ -969,9 +1062,15 @@ class Application:
         entry = float(row.entry_price or 0.0)
         qty = float(row.qty or 0.0)
 
-        fills = await self._exit_fills(row, is_long, QueryOrderStatus)
+        fills = (
+            share
+            if share is not None
+            else await self._exit_fills(row, is_long, QueryOrderStatus)
+        )
+        closed_qty: float | None = None
         if fills:
             filled_qty = sum(f.qty for f in fills)
+            closed_qty = filled_qty
             exit_price = sum(f.price * f.qty for f in fills) / filled_qty
             exit_reason, exit_note = _classify_exit(fills, row)
             pnl = (
@@ -1004,6 +1103,7 @@ class Application:
             exit_reason_note=exit_note,
             exit_order_id=fills[0].order_id if fills else None,
             trade_id=row.id,
+            closed_qty=closed_qty,
         )
         if closed is None:
             return None
@@ -1047,7 +1147,13 @@ class Application:
         for order in candidates:
             if str(getattr(order.side, "value", order.side)).lower() != want_side:
                 continue
-            if str(getattr(order.status, "value", order.status)).lower() != "filled":
+            if str(getattr(order.status, "value", order.status)).lower() not in (
+                "filled",
+                "partially_filled",
+            ):
+                # A partially filled exit closed real shares. Ignoring it
+                # leaves the ledger describing a trade that never happened
+                # and hides the exit that really closed it.
                 continue
             if not order.filled_at or not order.filled_qty:
                 continue

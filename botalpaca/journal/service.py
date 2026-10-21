@@ -248,6 +248,7 @@ class TradeJournal:
         mfe: float | None = None,
         mae: float | None = None,
         trade_id: int | None = None,
+        closed_qty: float | None = None,
     ) -> TradeModel | None:
         """Close an open trade.
 
@@ -255,6 +256,12 @@ class TradeJournal:
         which trade they are looking at pass it, because picking "the newest
         open row for this symbol" is only a guess: two OPEN rows on one symbol
         means the guess can close the wrong one.
+
+        ``closed_qty`` is how many shares the exit really closed. The row keeps
+        the size it was opened with, but the percentages and the R multiple
+        are measured against what was closed: a trade that was opened with ten
+        and closed with six earned its P&L on six, and dividing by ten would
+        understate every number that follows.
         """
         now = dt.datetime.now(dt.UTC)
         async with self._db.session() as session:
@@ -270,6 +277,7 @@ class TradeJournal:
             direction = SignalDirection(row.direction)
             entry = float(row.entry_price or 0.0)
             qty = float(row.qty or 0.0)
+            size = abs(closed_qty) if closed_qty is not None else abs(qty)
             risk_per_share = abs(entry - float(row.stop_price)) if row.stop_price else 0.0
 
             row.status = TradeStatus.CLOSED.value
@@ -286,15 +294,15 @@ class TradeJournal:
                 int((now - opened_at).total_seconds()) if opened_at is not None else 0
             )
             row.pnl = pnl
-            row.pnl_pct = (pnl / (entry * abs(qty)) * 100.0) if entry and qty else 0.0
+            row.pnl_pct = (pnl / (entry * size) * 100.0) if entry and size else 0.0
             row.r_multiple = (
-                pnl / (risk_per_share * abs(qty)) if risk_per_share > 0 and qty else 0.0
+                pnl / (risk_per_share * size) if risk_per_share > 0 and size else 0.0
             )
             if mfe is not None:
                 row.mfe = mfe
             if mae is not None:
                 row.mae = mae
-            if risk_per_share > 0 and qty:
+            if risk_per_share > 0 and size:
                 row.mfe_r = (row.mfe or 0.0) / risk_per_share
                 row.mae_r = (row.mae or 0.0) / risk_per_share
             del direction

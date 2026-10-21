@@ -515,3 +515,92 @@ async def test_reconciliation_judges_the_ledger_against_a_fresh_snapshot(
 
     assert reads["n"] == 2
     assert row.status == "OPEN"
+
+
+# --------------------------------------------------------------------------- the lots
+async def test_the_exit_of_several_lots_is_shared_out_between_them(database):
+    # One position made of two lots: the broker closes both with a single sell
+    # order, and the ledger has to split that fill between the rows. Handing
+    # the whole fill to each row would write the P&L of the whole position
+    # twice and the sum would never match the broker.
+    journal = TradeJournal(database)
+    first = await _open(journal, qty=10.0, entry_price=100.0)
+    second = await _open(journal, qty=5.0, entry_price=100.0)
+    app = _App(
+        database,
+        orders=[
+            _order(
+                "sl-1",
+                order_type="stop",
+                price=110.0,
+                qty=15.0,
+                filled_at=dt.datetime.now(UTC) + dt.timedelta(seconds=5),
+            )
+        ],
+    )
+
+    await _settle(app, [])
+
+    one = await _row(database, first.id)
+    two = await _row(database, second.id)
+    assert one.status == "CLOSED"
+    assert two.status == "CLOSED"
+    assert one.pnl == pytest.approx(100.0)
+    assert two.pnl == pytest.approx(50.0)
+    assert one.pnl + two.pnl == pytest.approx(150.0)
+
+
+async def test_an_exit_that_filled_only_in_part_still_closed_what_it_filled(database):
+    # A partially filled exit closed real shares. Ignoring it left the ledger
+    # describing a trade that never happened and hid the exit that closed it.
+    journal = TradeJournal(database)
+    trade = await _open(journal, qty=10.0, entry_price=100.0)
+    app = _App(
+        database,
+        orders=[
+            _order(
+                "sl-1",
+                status="partially_filled",
+                order_type="stop",
+                price=110.0,
+                qty=6.0,
+                filled_at=dt.datetime.now(UTC) + dt.timedelta(seconds=5),
+            )
+        ],
+    )
+
+    await _settle(app, [])
+
+    row = await _row(database, trade.id)
+    assert row.status == "CLOSED"
+    assert row.exit_price == pytest.approx(110.0)
+    assert row.pnl == pytest.approx(60.0)
+    # The percentages are measured against the six shares that were closed.
+    assert row.pnl_pct == pytest.approx(10.0)
+
+
+async def test_every_lot_is_priced_with_its_own_entry(database):
+    # Two lots of the same position opened at different prices. Each one
+    # carries its own entry, so each one earns its own P&L.
+    journal = TradeJournal(database)
+    first = await _open(journal, qty=10.0, entry_price=100.0)
+    second = await _open(journal, qty=5.0, entry_price=120.0)
+    app = _App(
+        database,
+        orders=[
+            _order(
+                "sl-1",
+                order_type="stop",
+                price=110.0,
+                qty=15.0,
+                filled_at=dt.datetime.now(UTC) + dt.timedelta(seconds=5),
+            )
+        ],
+    )
+
+    await _settle(app, [])
+
+    one = await _row(database, first.id)
+    two = await _row(database, second.id)
+    assert one.pnl == pytest.approx(100.0)
+    assert two.pnl == pytest.approx(-50.0)
