@@ -140,7 +140,6 @@ class OrderBuilder:
                 )
 
         side = alpaca_side(plan.direction.entry_side)
-        tif = alpaca_tif(plan.time_in_force)
         # For a stop / stop-limit *entry*, ``stop_loss`` is the trigger price of
         # the entry itself, not a protective leg, so it must not be turned into
         # a bracket child order.
@@ -148,6 +147,11 @@ class OrderBuilder:
         has_protection = plan.take_profit is not None or (
             plan.stop_loss is not None and not is_stop_entry
         )
+        # Alpaca gives a bracket's legs the same time-in-force as the order that
+        # carries them, so a DAY entry leaves the position naked the moment the
+        # session closes. The entry is the only order that has to be
+        # session-scoped; the protection has to outlive it.
+        tif = alpaca_tif(TimeInForce.GTC if has_protection else plan.time_in_force)
 
         if has_protection and plan.order_type not in _BRACKET_CAPABLE_TYPES:
             raise UnsupportedOrderShapeError(

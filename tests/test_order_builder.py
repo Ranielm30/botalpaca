@@ -56,6 +56,34 @@ def test_stop_limit_entry():
     assert type(req).__name__ == "StopLimitOrderRequest"
 
 
+def test_an_entry_with_protection_outlives_the_session():
+    """Alpaca hangs a bracket's legs off the entry's time-in-force, so a DAY
+    entry would leave the position naked the moment the session closes. The
+    entry is the only order that has to be session-scoped."""
+    req = OrderBuilder.build_entry(_plan(stop_loss=97.0, take_profit=106.0))
+    assert req.time_in_force == TimeInForce.GTC
+
+
+def test_a_bare_entry_keeps_the_time_in_force_the_plan_asked_for():
+    assert (
+        OrderBuilder.build_entry(_plan(time_in_force=TimeInForce.GTC)).time_in_force
+        == TimeInForce.GTC
+    )
+    assert (
+        OrderBuilder.build_entry(_plan(time_in_force=TimeInForce.DAY)).time_in_force
+        == TimeInForce.DAY
+    )
+
+
+def test_a_stop_entry_is_left_alone_because_its_stop_is_the_trigger():
+    """``stop_loss`` on a stop entry is the trigger price of the entry itself,
+    not a protective leg, so the entry stays bare."""
+    req = OrderBuilder.build_entry(
+        _plan(order_type=OrderType.STOP, stop_loss=101.0, time_in_force=TimeInForce.DAY)
+    )
+    assert req.time_in_force == TimeInForce.DAY
+
+
 def test_qty_and_notional_together_rejected():
     with pytest.raises(UnsupportedOrderShapeError):
         OrderBuilder.build_entry(_plan(notional=1000.0))
