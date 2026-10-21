@@ -505,6 +505,14 @@ class ProtectionState(Domain):
     stop makes a protected trade look like it risked its own profit, and leaves
     no denominator at all once a trailing stop replaces the fixed one.
     """
+    covered_qty: float = 0.0
+    """Shares already held by live exit orders, counted once per group.
+
+    Alpaca lets one position carry several lots, each with its own exits, while
+    SQLite keeps a single row per symbol. Comparing this number with the
+    position size is the only way to notice that one lot is protected and
+    another is standing naked: a symbol is not protected, a quantity is.
+    """
     # Orders that still reserve the shares but cannot execute: a bracket child
     # left in HELD. They must be cleared before any replacement exit can be
     # created, or Alpaca rejects the new order for insufficient qty available.

@@ -246,6 +246,98 @@ async def test_the_state_carries_the_target_the_ledger_remembers(database):
     assert state.take_profit_price == pytest.approx(90.87)
 
 
+# -- partial coverage ----------------------------------------------------------------
+async def test_an_oco_counts_its_shares_once(database):
+    """The take-profit and the stop of an OCO guard the *same* shares.
+
+    They are alternatives, not two lots. Adding both would claim 172 shares
+    were protected when only 86 exist, and the top-up built on that number
+    would be refused by Alpaca for "insufficient qty available".
+    """
+    stop = fake_order_raw(
+        "sl-1", symbol="WMT", order_type="stop", side="sell",
+        stop_price=114.21, qty=86.0, status="held",
+    )
+    parent = fake_order_raw(
+        "tp-1", symbol="WMT", order_type="limit", side="sell",
+        limit_price=127.59, qty=86.0, status="new", order_class="oco", legs=[stop],
+    )
+    manager, _, _ = await _setup(database, [parent, stop])
+    state = await manager.state_for_position(
+        PAPER, make_position(symbol="WMT", entry=117.23, current=117.5)
+    )
+    assert state.has_stop is True
+    assert state.has_take_profit is True
+    assert state.covered_qty == pytest.approx(86.0)
+
+
+async def test_two_separate_lots_are_counted_apart(database):
+    """Two independent stops guard two different lots, and both add up."""
+    first = fake_order_raw(
+        "sl-1", symbol="WMT", order_type="stop", side="sell",
+        stop_price=111.88, qty=112.0, status="new",
+    )
+    second = fake_order_raw(
+        "sl-2", symbol="WMT", order_type="stop", side="sell",
+        stop_price=114.21, qty=86.0, status="new",
+    )
+    manager, _, _ = await _setup(database, [first, second])
+    state = await manager.state_for_position(
+        PAPER, make_position(symbol="WMT", entry=117.23, current=117.5)
+    )
+    assert state.covered_qty == pytest.approx(198.0)
+
+
+async def test_a_top_up_protects_only_the_shares_nothing_else_holds(database):
+    """One lot survived the close, the other was opened without protection.
+
+    Asking Alpaca for the whole 198 would be rejected, because the 86 behind
+    the live stop are already reserved. Only the 112 left over are free.
+    """
+    existing = fake_order_raw(
+        "sl-1", symbol="WMT", order_type="stop", side="sell",
+        stop_price=114.21, qty=86.0, status="new",
+    )
+    manager, _, client = await _setup(database, [existing])
+    position = make_position(symbol="WMT", entry=117.23, current=117.5, qty=198.0)
+    await manager.ensure_stop(
+        environment=PAPER, position=position, atr=2.0, qty=112.0, reason="reconciliación"
+    )
+    assert client.submitted, "a top-up order must go out"
+    assert client.submitted[-1].qty == pytest.approx(112.0)
+    # The lot that was already protected keeps its stop untouched.
+    assert "sl-1" not in client.cancelled
+
+
+async def test_reconciliation_completes_the_shares_a_symbol_left_naked(database):
+    """The position is 198, the live stop covers 86: the rest is unprotected.
+
+    SQLite keeps one row per symbol, so a protected lot used to hide the other
+    one completely and reconciliation reported the symbol as covered.
+    """
+    existing = fake_order_raw(
+        "sl-1", symbol="WMT", order_type="stop", side="sell",
+        stop_price=114.21, qty=86.0, status="new",
+    )
+    manager, _, client = await _setup(database, [existing])
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="WMT",
+        qty=86.0,
+        entry_price=117.23,
+        stop_order_id="sl-1",
+        stop_price=114.21,
+        initial_stop_price=111.88,
+    )
+    position = make_position(symbol="WMT", entry=117.23, current=117.5, qty=198.0)
+    notes = await manager.reconcile(
+        environment=PAPER, positions=[position], protect_missing=True
+    )
+    assert client.submitted, "the uncovered lot must get a stop of its own"
+    assert client.submitted[-1].qty == pytest.approx(112.0)
+    assert any("WMT" in note and "faltaban" in note for note in notes), notes
+
+
 # -- break-even ----------------------------------------------------------------------
 async def test_move_to_break_even_replaces_stop(database):
     manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0)])

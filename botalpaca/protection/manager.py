@@ -98,6 +98,45 @@ def _group_child_ids(orders: Sequence[OrderState]) -> set[str]:
     return children
 
 
+def _exit_coverage(orders: Sequence[OrderState], exit_side: OrderSide) -> float:
+    """Shares already spoken for by live exit orders on the closing side.
+
+    An OCO carries its take-profit and its stop over the *same* shares: they
+    are alternatives, not two lots. Adding both would report double the
+    protection that exists, and any top-up built on that number would be
+    refused for "insufficient qty available" -- the exact rejection a
+    partially-protected position used to produce. Each group therefore counts
+    once, at the size of its largest leg.
+
+    Group membership comes from the same two places ``_group_child_ids`` reads:
+    the ids the engine resolved, or the legs a parent still carries.
+    """
+    protected = _group_child_ids(orders)
+    parents: dict[str, str] = {}
+    for order in orders:
+        for leg in getattr(order, "legs", None) or ():
+            if leg.id:
+                parents[str(leg.id)] = str(order.id)
+    groups: dict[frozenset[str], float] = {}
+    for order in orders:
+        if order.side is not exit_side:
+            continue
+        if _is_inert(order, protected_ids=protected):
+            continue
+        kind = _type_value(order)
+        if kind not in _STOP_TYPES and kind != "limit" and not _is_trailing(order):
+            continue
+        resolved = getattr(order, "group_ids", None)
+        if resolved:
+            members = frozenset(str(member) for member in resolved)
+        else:
+            # Unresolved orders only name their parent, so a leg and the order
+            # holding it have to meet on the parent's id.
+            members = frozenset({parents.get(str(order.id), str(order.id))})
+        groups[members] = max(groups.get(members, 0.0), float(order.qty or 0.0))
+    return sum(groups.values())
+
+
 def _class_value(order: OrderState) -> str:
     raw = getattr(order, "order_class", None)
     if raw is None:
@@ -300,6 +339,7 @@ class PositionProtectionManager:
 
             if _groups(state.stop_order_id) & _groups(state.take_profit_order_id):
                 state.order_class = OrderClass.OCO
+        state.covered_qty = _exit_coverage(mine, exit_side)
         return state
 
     async def state_for_position(
@@ -871,9 +911,17 @@ class PositionProtectionManager:
         position: PositionSnapshot,
         stop_price: float | None = None,
         atr: float | None = None,
+        qty: float | None = None,
         reason: str = "posición sin stop",
     ) -> ProtectionState:
-        """Guarantee a stop exists. Places a real order when missing."""
+        """Guarantee a stop exists. Places a real order when missing.
+
+        ``qty`` names how many shares still need covering. One position can be
+        several lots, each carrying its own exits, and only the shares not
+        already reserved are free to protect: asking for the whole size would
+        be rejected for "insufficient qty available". Left unset the full
+        position is requested, which is the right answer when nothing is live.
+        """
         state = await self.state_for_position(environment, position)
         # An inert child still reserves the shares even when the position looks
         # protected, so Alpaca rejects every future exit for "insufficient qty
@@ -881,7 +929,12 @@ class PositionProtectionManager:
         # exists: the shares stay locked for the rest of the trade otherwise.
         if state.inert_order_ids:
             await self._clear_inert_orders(environment, position, state)
-        if state.has_stop:
+        # A live stop covering the requested shares is the answer; one covering
+        # only part of them is not, and has to be topped up.
+        if state.has_stop and qty is None:
+            return state
+        protect_qty = abs(position.qty) if qty is None else float(qty)
+        if protect_qty <= 0:
             return state
 
         # Alpaca reserves the shares behind every open exit order, so two
@@ -889,7 +942,9 @@ class PositionProtectionManager:
         # hold a stop AND a target is an OCO group, whose parent is the
         # take-profit limit and whose child is the stop. It was live-verified on
         # the paper account, so a missing target is never an excuse to drop one.
-        if state.take_profit_order_id:
+        # A top-up never goes through here: the group is built for the whole
+        # position and would claim shares another lot is already protecting.
+        if qty is None and state.take_profit_order_id:
             # The caller usually knows the level it wants; the state may carry
             # none at all when there is no stop yet, which is exactly the case
             # this branch exists for.
@@ -938,7 +993,7 @@ class PositionProtectionManager:
                 position,
                 OrderBuilder.build_protective_stop(
                     symbol=position.symbol,
-                    qty=abs(position.qty),
+                    qty=protect_qty,
                     exit_side=position.direction,
                     stop_price=price,
                 ),
@@ -1893,23 +1948,38 @@ class PositionProtectionManager:
                         notes.append(
                             f"🔒 {symbol}: stop ajustado al riesgo aceptado ({tighter})"
                         )
-            if not state.has_stop:
+            # What matters is whether every share has an exit standing behind
+            # it, not whether one order exists for the symbol. A position can
+            # be several lots while SQLite keeps a single row per symbol, so a
+            # protected lot used to mask a second one left standing naked.
+            wanted = abs(position.qty)
+            missing = wanted if not state.has_stop else wanted - state.covered_qty
+            if missing > 1e-6:
                 if not auto:
                     notes.append(f"⚠️ {symbol}: posición abierta SIN stop en Alpaca")
                     continue
+                partial = state.has_stop
                 try:
                     await self.ensure_stop(
                         environment=environment,
                         position=position,
                         atr=atr_by_symbol.get(symbol),
+                        qty=missing if partial else None,
                         reason="reconciliación",
                     )
-                    notes.append(f"🛡️ {symbol}: stop de emergencia creado")
                 except Exception as exc:  # noqa: BLE001 - reconciliation must not abort
                     notes.append(
                         f"❌ {symbol}: SIN stop — {readable_reason(exc)}"
                     )
                     log.error("protection.reconcile.failed", symbol=symbol, error=str(exc))
+                else:
+                    if partial:
+                        notes.append(
+                            f"🛡️ {symbol}: stop completado sobre las acciones que faltaban "
+                            f"({missing:.4g} de {wanted:.4g})"
+                        )
+                    else:
+                        notes.append(f"🛡️ {symbol}: stop de emergencia creado")
         for symbol in sorted(set(stored) - set(live)):
             # The position is gone, so its exits are gone too. Deleting the
             # SQLite row alone left the broker orders live: DOCU closed
