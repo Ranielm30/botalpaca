@@ -953,28 +953,6 @@ class PositionProtectionManager:
         if protect_qty <= 0:
             return state
 
-        # Alpaca reserves the shares behind every open exit order, so two
-        # independent exits on one position are rejected outright. The way to
-        # hold a stop AND a target is an OCO group, whose parent is the
-        # take-profit limit and whose child is the stop. It was live-verified on
-        # the paper account, so a missing target is never an excuse to drop one.
-        # A top-up never goes through here: the group is built for the whole
-        # position and would claim shares another lot is already protecting.
-        if qty is None and state.take_profit_order_id:
-            # The caller usually knows the level it wants; the state may carry
-            # none at all when there is no stop yet, which is exactly the case
-            # this branch exists for.
-            merged = await self._merge_into_oco(
-                environment, position, state, stop_price=stop_price
-            )
-            # The group already carries the stop. Falling through would build
-            # a bare stop on top of it, which takes the shares and leaves the
-            # operator with a stop and no target -- the exact state we just
-            # spent this round removing.
-            if merged is not None and merged.has_stop:
-                return merged
-
-
         # The fallback is measured from the live price, which is the only way to
         # protect a naked position with no entry price and no ATR. It knows
         # nothing about the risk the trade was approved for. A bracket whose DAY
@@ -983,6 +961,13 @@ class PositionProtectionManager:
         # the position then carries twice the risk it was opened with, having
         # risked nothing in between. The frozen baseline is the surviving record
         # of that risk, so it wins here whenever it is still a legal stop.
+        #
+        # The level is settled *before* the group is attempted, because the
+        # group needs it: a live target holds the shares, so a stop that goes
+        # out on its own is refused for "insufficient qty available" and the
+        # position ends the pass with a target and no stop -- the worst shape
+        # there is. The frozen baseline still remembers the level, so the group
+        # can be built with it.
         fallback = self._fallback_stop(position, atr)
         price = (
             stop_price
@@ -996,6 +981,54 @@ class PositionProtectionManager:
                 f"No se puede calcular un stop para {position.symbol} sin ATR ni precio explícito"
             )
         price = self._sanitize_stop(price, position)
+
+        # The group needs the two levels on the right sides of each other: a
+        # long's stop has to sit below its target, a short's above it. A stop
+        # that crossed the target would make the group impossible to build, and
+        # an unbuildable group is how a position ends the pass with a target
+        # and no stop. The levels are the ones the ledger remembers, so they
+        # are what the group has to agree with.
+        target = state.take_profit_price
+        if target is not None:
+            if position.qty >= 0 and price >= target:
+                price = round(float(target) * 0.99, 2)
+            elif position.qty < 0 and price <= target:
+                price = round(float(target) * 1.01, 2)
+            price = self._sanitize_stop(price, position)
+
+        # Alpaca reserves the shares behind every open exit order, so two
+        # independent exits on one position are rejected outright. The way to
+        # hold a stop AND a target is an OCO group, whose parent is the
+        # take-profit limit and whose child is the stop. It was live-verified on
+        # the paper account, so a missing target is never an excuse to drop one.
+        # A top-up never goes through here: the group is built for the whole
+        # position and would claim shares another lot is already protecting.
+        if qty is None and state.take_profit_order_id:
+            # The caller usually knows the level it wants; the state may carry
+            # none at all when there is no stop yet, which is exactly the case
+            # this branch exists for.
+            try:
+                merged = await self._merge_into_oco(
+                    environment, position, state, stop_price=price
+                )
+            except (BotalpacaError, BrokerError, RuntimeError) as exc:
+                # The group was refused and the target it needed was already
+                # released, so the pass falls through to a bare stop: a
+                # position with no stop at all is the one shape the operator
+                # cannot accept.
+                log.warning(
+                    "protection.oco_stop_refused",
+                    environment=environment.value,
+                    symbol=position.symbol,
+                    error=str(exc),
+                )
+            else:
+                # The group already carries the stop. Falling through would build
+                # a bare stop on top of it, which takes the shares and leaves the
+                # operator with a stop and no target -- the exact state we just
+                # spent this round removing.
+                if merged is not None and merged.has_stop:
+                    return merged
 
         await self._await_shares_free(
             environment, position.symbol, ignore=state.inert_order_ids

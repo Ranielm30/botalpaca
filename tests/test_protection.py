@@ -1396,3 +1396,100 @@ async def test_a_trailing_symbol_keeps_the_exit_it_has(database):
 
     assert not any("day retirada" in note for note in notes), notes
     assert "trail-1" not in client.cancelled
+
+
+# -- a target that outlived its stop --------------------------------------------------
+
+
+async def test_a_target_without_a_stop_is_rebuilt_as_one_group(database):
+    # A live target holds the shares, so a stop that goes out on its own is
+    # refused for "insufficient qty available". The stop has to arrive as the
+    # other leg of the group, and the group needs a level to be built with.
+    manager, _, client = await _setup(database, [_tp_order("tp-1")])
+
+    state = await manager.ensure_stop(
+        environment=PAPER,
+        position=make_position(symbol="AAPL", entry=100.0, current=100.0),
+        atr=2.0,
+        reason="prueba",
+    )
+
+    request = client.submitted[-1]
+    assert request.take_profit is not None
+    assert request.stop_loss is not None
+    assert "tp-1" in client.cancelled
+    assert state.has_stop is True
+
+
+async def test_a_refused_group_still_leaves_a_stop_behind(database):
+    # The group was refused and the target it needed was already released, so
+    # the pass has to fall back to a bare stop: a position with no stop at all
+    # is the one shape the operator cannot accept.
+    manager, _, client = await _setup(database, [_tp_order("tp-1")])
+    _refuse_once(client, BrokerError("el broker no admite el grupo", status_code=403))
+
+    state = await manager.ensure_stop(
+        environment=PAPER,
+        position=make_position(symbol="AAPL", entry=100.0, current=100.0),
+        atr=2.0,
+        reason="prueba",
+    )
+
+    assert state.has_stop is True
+    request = client.submitted[-1]
+    assert getattr(request, "take_profit", None) is None
+    assert getattr(request, "stop_loss", None) is None
+
+
+async def test_reconciliation_rebuilds_a_target_that_lost_its_stop(database):
+    # The shape production ended up in: the target is alive, the stop is gone.
+    # The pass has to hand the position back with both levels standing.
+    manager, _, client = await _setup(database, [_tp_order("tp-1")])
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="AAPL",
+        qty=10.0,
+        entry_price=100.0,
+        take_profit_order_id="tp-1",
+        take_profit_price=106.0,
+        initial_stop_price=97.0,
+    )
+
+    notes = await manager.reconcile(
+        environment=PAPER,
+        positions=[make_position(symbol="AAPL", entry=100.0, current=100.0)],
+        protect_missing=True,
+    )
+
+    request = client.submitted[-1]
+    assert request.take_profit is not None
+    assert request.stop_loss is not None
+    assert not any("SIN stop" in note for note in notes)
+
+
+async def test_a_stop_that_would_cross_the_target_is_pulled_back(database):
+    # The group is only buildable when the stop sits on the losing side of the
+    # target. A stop that crossed it would leave the position with a target and
+    # no stop, which is the shape the operator cannot accept.
+    manager, _, client = await _setup(database, [_tp_order("tp-1", limit=110.0)])
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="AAPL",
+        qty=10.0,
+        entry_price=100.0,
+        take_profit_order_id="tp-1",
+        take_profit_price=110.0,
+        initial_stop_price=150.0,
+    )
+
+    await manager.ensure_stop(
+        environment=PAPER,
+        position=make_position(symbol="AAPL", entry=100.0, current=200.0),
+        atr=2.0,
+        reason="prueba",
+    )
+
+    request = client.submitted[-1]
+    assert request.take_profit is not None
+    assert request.stop_loss is not None
+    assert request.stop_loss.stop_price < request.take_profit.limit_price, notes
