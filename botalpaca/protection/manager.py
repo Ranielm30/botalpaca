@@ -228,6 +228,14 @@ class PositionProtectionManager:
                 live.order_class = OrderClass(row.order_class)
             except ValueError:
                 live.order_class = None
+        # The level outlives the order. A DAY take-profit dies at the close and
+        # takes its id with it, but the price it was aiming at is a fact the
+        # ledger already recorded. Leaving it behind here meant every stop
+        # rebuild wiped the only record of the target, so reconciliation found
+        # nothing to restore and the position stayed targetless for the rest
+        # of the trade.
+        if live.take_profit_price is None and row.take_profit_price is not None:
+            live.take_profit_price = row.take_profit_price
         if row.stop_order_id and live.stop_order_id != row.stop_order_id:
             live.notes.append(
                 f"El stop registrado en SQLite ({row.stop_order_id}) no coincide con Alpaca"
@@ -313,6 +321,12 @@ class PositionProtectionManager:
         # Falls back to the live stop only for rows registered before the
         # baseline existed, and only while nothing has moved it yet.
         live.initial_stop_price = row.initial_stop_price or row.stop_price
+        # The level outlives the order: a DAY take-profit dies at the close
+        # with its id, but the price it aimed at stays on our side. Without it
+        # a rebuilt stop would persist a blank target and reconciliation would
+        # have nothing to put back.
+        if live.take_profit_price is None and row.take_profit_price is not None:
+            live.take_profit_price = row.take_profit_price
         return live
 
     # ------------------------------------------------------------ registration
@@ -944,6 +958,10 @@ class PositionProtectionManager:
             raise ValidationError(
                 f"Alpaca no confirmó el stop de protección para {position.symbol}"
             )
+        # The target has to be written back along with the stop. ``upsert``
+        # assigns every field it is handed, so persisting only the stop would
+        # blank out the level the ledger still remembers -- and that level is
+        # what reconciliation uses to put the take-profit back the next pass.
         await self._persist(
             environment,
             position.symbol,
@@ -951,6 +969,7 @@ class PositionProtectionManager:
             entry_price=position.avg_entry_price,
             stop_order_id=result.order.id,
             stop_price=price,
+            take_profit_price=state.take_profit_price,
         )
         # Freeze the baseline here as well, not just on the way in. A position
         # that reached this point without one is an orphan that had no stop in

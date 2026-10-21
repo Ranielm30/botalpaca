@@ -191,6 +191,61 @@ async def test_ensure_stop_never_claims_success_without_order_id(database):
         await manager.ensure_stop(environment=PAPER, position=make_position(current=102.0), stop_price=98.0)
 
 
+async def test_a_remembered_target_survives_the_rebuild_of_a_stop(database):
+    """Placing an emergency stop must not blank out the target.
+
+    The DAY legs die at the close and take their ids with them, but the levels
+    are the record of what the trade was opened to do. ``upsert`` assigns every
+    field it is handed, so a stop persisted on its own used to wipe the target
+    -- and reconciliation reads exactly that column to put the take-profit
+    back. One rebuild was enough to lose it for the rest of the trade.
+    """
+    manager, _, client = await _setup(database, [], env=PAPER)
+    position = make_position(symbol="XOM", entry=178.24, current=178.0)
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="XOM",
+        qty=57.0,
+        entry_price=178.24,
+        take_profit_price=198.64,
+        initial_stop_price=167.5,
+    )
+    # The overnight close killed every leg: nothing is live in Alpaca.
+    assert client.orders == {}
+    state = await manager.ensure_stop(
+        environment=PAPER, position=position, atr=5.0, reason="reconciliación"
+    )
+    assert state.has_stop is True
+    # Read back through the manager: the level is still on our side, so the
+    # next reconciliation pass has something to restore.
+    assert (await manager.get_state(PAPER, "XOM")).take_profit_price == pytest.approx(198.64)
+
+
+async def test_the_state_carries_the_target_the_ledger_remembers(database):
+    """No live take-profit is not the same as no target.
+
+    A position whose target order expired still has a level recorded against
+    it. Reporting ``None`` there made every reader of the state believe the
+    position had never had one, which is how a protected trade ended up
+    advertised as open-ended.
+    """
+    manager, _, _ = await _setup(database, [], env=PAPER)
+    position = make_position(symbol="DOCU", entry=80.42, current=81.0)
+    await manager.register_entry_protection(
+        environment=PAPER,
+        symbol="DOCU",
+        qty=126.0,
+        entry_price=80.42,
+        take_profit_price=90.87,
+    )
+    state = await manager.state_for_position(PAPER, position)
+    # The order is gone, so this is not a live take-profit...
+    assert state.has_take_profit is False
+    assert state.take_profit_order_id is None
+    # ...but the level is still known.
+    assert state.take_profit_price == pytest.approx(90.87)
+
+
 # -- break-even ----------------------------------------------------------------------
 async def test_move_to_break_even_replaces_stop(database):
     manager, engine, client = await _setup(database, [_stop_order("s1", stop=97.0)])
