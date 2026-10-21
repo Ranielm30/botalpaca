@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import time
+
 import pytest
 
 from botalpaca.db.repositories import AppStateRepository, OrderAuditRepository
@@ -15,6 +17,7 @@ from botalpaca.domain.errors import (
     RiskRejectedError,
 )
 from botalpaca.domain.models import TradePlan
+from botalpaca.execution import engine as engine_module
 from botalpaca.execution.client import BrokerError
 from botalpaca.execution.engine import (
     STATUS_FAILED,
@@ -270,6 +273,88 @@ async def test_close_position_all_when_nothing_given(database):
     call = client.closed_calls[0]
     assert call["percentage"] == "100"
     assert call["qty"] is None
+
+
+# -- closing a position whose shares are still reserved --------------------------------
+class _HeldSharesClient:
+    """A broker that keeps the shares reserved for the first closes.
+
+    Alpaca marks a cancelled exit terminal at once but hands the shares back a
+    moment later, and a close sent in that window comes back "insufficient qty
+    available ... held_for_orders". The stub reproduces the refusal and then
+    lets the close through, so the engine has to wait and try again instead of
+    leaving the position open -- which is what happened to CVX: fifteen
+    rejected closes and a protection rebuilt again and again in between.
+    """
+
+    def __init__(self, *, refusals: int = 1) -> None:
+        self.environment_name = TradingEnvironment.PAPER
+        self.refusals = refusals
+        self.attempts = 0
+        self.timeline: list[str] = []
+        self.marks: dict[str, float] = {}
+        self.closed: list[tuple[str, dict]] = []
+
+    async def get_orders(self, **kwargs):
+        self.timeline.append("probe")
+        return []
+
+    async def cancel_orders(self, symbol=None):
+        self.timeline.append("cancel")
+        self.marks["cancel"] = time.monotonic()
+        return []
+
+    async def close_position(self, symbol: str, **kwargs):
+        self.timeline.append("close")
+        self.marks["close"] = time.monotonic()
+        self.attempts += 1
+        if self.attempts <= self.refusals:
+            raise BrokerError(
+                "Alpaca rejected the request: insufficient qty available for order "
+                "(requested: 47, available: 0, held_for_orders: 47)",
+                status_code=403,
+            )
+        self.closed.append((symbol, kwargs))
+        return fake_order_raw("close-1", symbol=symbol, side="sell")
+
+
+async def test_a_close_that_finds_the_shares_held_waits_and_tries_again(database, monkeypatch):
+    monkeypatch.setattr(engine_module, "_EXIT_RELEASE_SETTLE_SECONDS", 0.05)
+    client = _HeldSharesClient(refusals=1)
+    engine, _ = await _engine(database, client=client)
+
+    result = await engine.close_position("AAPL", environment=TradingEnvironment.PAPER)
+
+    assert client.attempts == 2
+    assert client.closed and client.closed[0][0] == "AAPL"
+    assert bool(result) is True
+
+
+async def test_the_close_waits_for_the_shares_to_travel(database, monkeypatch):
+    # The exits leave the list of open orders the moment they are cancelled,
+    # but the broker keeps the shares for a moment longer. Selling in that
+    # window is what produced the refusal.
+    monkeypatch.setattr(engine_module, "_EXIT_RELEASE_SETTLE_SECONDS", 0.05)
+    client = _HeldSharesClient(refusals=0)
+    engine, _ = await _engine(database, client=client)
+
+    await engine.close_position("AAPL", environment=TradingEnvironment.PAPER)
+
+    assert client.marks["close"] - client.marks["cancel"] >= 0.3
+    assert client.timeline.index("close") > client.timeline.index("cancel")
+
+
+async def test_a_close_that_cannot_release_the_shares_says_so(database, monkeypatch):
+    monkeypatch.setattr(engine_module, "_EXIT_RELEASE_SETTLE_SECONDS", 0.05)
+    client = _HeldSharesClient(refusals=99)
+    engine, _ = await _engine(database, client=client)
+
+    with pytest.raises(OrderRejectedByBrokerError) as failure:
+        await engine.close_position("AAPL", environment=TradingEnvironment.PAPER)
+
+    assert "insufficient qty" in str(failure.value)
+    assert client.attempts == 3
+    assert not client.closed
 
 
 async def test_get_open_orders_exposes_nested_legs(database):

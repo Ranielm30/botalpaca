@@ -49,6 +49,15 @@ from botalpaca.execution.mapping import to_order_state
 # when looking for protection.
 _TERMINAL_STATUSES = frozenset({"filled", "canceled", "expired", "replaced", "rejected"})
 
+# Alpaca marks a cancelled exit terminal at once but hands the shares back a
+# moment later. A close sent in between is refused with "insufficient qty
+# available ... held_for_orders", so the wait has to give the shares the time
+# to travel before the position is sold.
+_EXIT_RELEASE_SETTLE_SECONDS = 1.0
+
+# How many times a close is sent while the broker still holds the shares.
+_CLOSE_ATTEMPTS = 3
+
 logger = get_logger(__name__)
 
 __all__ = ["ExecutionEngine", "SubmissionResult", "KILL_SWITCH_KEY"]
@@ -318,15 +327,29 @@ class ExecutionEngine:
     async def _await_exits_released(
         self, symbol: str, *, attempts: int = 20, delay: float = 0.5
     ) -> bool:
-        """Wait until no open exit still reserves the shares for ``symbol``."""
+        """Wait until no open exit still reserves the shares for ``symbol``.
+
+        An empty list is not the same as free shares. A bulk cancellation marks
+        the exits terminal at once, but Alpaca hands the shares back a moment
+        later, and a close that arrives in between comes back "insufficient qty
+        available ... held_for_orders". The wait therefore asks twice: the
+        exits have to be gone AND the shares have had the time to travel.
+        """
+        empty_since: float | None = None
         for attempt in range(max(attempts, 1)):
             try:
                 orders = await self.get_live_orders_for_symbol(symbol)
             except (BotalpacaError, BrokerError, RuntimeError) as exc:
                 logger.warning("execution.exit_probe_failed", symbol=symbol, error=str(exc))
             else:
-                if not orders:
-                    return True
+                if orders:
+                    empty_since = None
+                else:
+                    now = asyncio.get_running_loop().time()
+                    if empty_since is None:
+                        empty_since = now
+                    elif now - empty_since >= _EXIT_RELEASE_SETTLE_SECONDS:
+                        return True
             await asyncio.sleep(min(delay * (1.5**attempt), 2.5))
         return False
 
@@ -401,17 +424,46 @@ class ExecutionEngine:
         # Cancelling does not release the shares straight away. Closing in the
         # same breath is rejected for insufficient qty, so wait for the exits to
         # actually go terminal before selling.
-        await self._await_exits_released(target)
+        released = await self._await_exits_released(target)
+        if not released:
+            logger.warning(
+                "execution.exits_still_held", environment=environment.value, symbol=target
+            )
 
         # The client builds the ClosePositionRequest itself; passing one in used
         # to raise TypeError and left the position open.
-        try:
-            raw_order = await self._client.close_position(
-                symbol.upper(), qty=qty, percentage=percentage
-            )
-        except BrokerError as exc:
-            await self._record_failure(None, environment, str(exc), symbol=symbol)
-            raise OrderRejectedByBrokerError(str(exc)) from exc
+        raw_order = None
+        failure: str | None = None
+        for attempt in range(_CLOSE_ATTEMPTS):
+            try:
+                raw_order = await self._client.close_position(
+                    symbol.upper(), qty=qty, percentage=percentage
+                )
+            except BrokerError as exc:
+                message = str(exc)
+                if "insufficient qty" not in message.lower():
+                    await self._record_failure(None, environment, message, symbol=symbol)
+                    raise OrderRejectedByBrokerError(message) from exc
+                # The shares were still reserved. The exits are already
+                # cancelled, so the release is on its way: give it a moment and
+                # try again. Sending the close once and letting the broker
+                # refuse it is what left a position open for hours, with the
+                # protection rebuilt again and again in between.
+                failure = message
+                logger.warning(
+                    "execution.close_shares_held",
+                    environment=environment.value,
+                    symbol=target,
+                    attempt=attempt,
+                    error=message,
+                )
+                await self._await_exits_released(target, attempts=6)
+                continue
+            break
+        if raw_order is None:
+            message = failure or "el broker no acepto el cierre"
+            await self._record_failure(None, environment, message, symbol=symbol)
+            raise OrderRejectedByBrokerError(message)
         order = to_order_state(raw_order, environment)
         await self._audit_simple(
             ACTION_CLOSE,
