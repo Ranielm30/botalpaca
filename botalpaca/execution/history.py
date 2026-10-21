@@ -100,6 +100,24 @@ def _iso(value: dt.datetime) -> str:
     return value.astimezone(dt.UTC).isoformat().replace("+00:00", "Z")
 
 
+def _normalize_side(value: Any) -> str:
+    """Alpaca names the side of a short sale ``sell_short``.
+
+    A short entry is a sale: the broker marks it apart because the shares were
+    borrowed, but for the ledger it opens a short position exactly like a plain
+    sale does. Reading it as anything else leaves every short out of the
+    ledger, and the cover that comes later is then counted as a new entry
+    instead of the exit it is -- which is how the whole account ends up with a
+    profit that never happened.
+    """
+    raw = str(value or "").strip().lower()
+    if raw.startswith("sell"):
+        return SELL
+    if raw.startswith("buy"):
+        return BUY
+    return ""
+
+
 def parse_activities(activities: Iterable[dict[str, Any]]) -> list[BrokerFill]:
     """Turn Alpaca's FILL activities into fills.
 
@@ -118,7 +136,7 @@ def parse_activities(activities: Iterable[dict[str, Any]]) -> list[BrokerFill]:
         if activity_type and activity_type != "FILL":
             continue
         symbol = str(item.get("symbol") or "").upper()
-        side = str(item.get("side") or "").lower()
+        side = _normalize_side(item.get("side"))
         try:
             qty = float(item.get("qty") or 0.0)
             price = float(item.get("price") or 0.0)

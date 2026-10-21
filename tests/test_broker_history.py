@@ -426,3 +426,69 @@ async def test_the_card_keeps_the_journal_as_the_fallback():
 
     assert "Total cerrado" in result.text
     assert "Alpaca" not in result.text
+
+
+# -- the short sale Alpaca names apart -------------------------------------------------
+
+
+def test_a_short_sale_is_read_as_the_sale_it_is():
+    # Alpaca calls the side of a short entry "sell_short". The shares were
+    # borrowed, but for the ledger it is a sale like any other: reading it as
+    # anything else leaves every short out of the ledger.
+    fills = parse_activities(
+        [
+            {
+                "activity_type": "FILL",
+                "id": "act-1",
+                "symbol": "SBUX",
+                "side": "sell_short",
+                "qty": "59",
+                "price": "89.98",
+                "order_id": "ord-9",
+                "order_status": "filled",
+                "transaction_time": "2024-01-02T15:04:05.123456Z",
+            }
+        ]
+    )
+
+    assert len(fills) == 1
+    assert fills[0].side == "sell"
+
+
+async def test_a_short_entry_and_its_cover_make_one_short_operation():
+    # If the short entry is left out, the cover is read as an entry and the
+    # whole account shows a profit it never made.
+    fills = parse_activities(
+        [
+            {
+                "activity_type": "FILL",
+                "id": "act-1",
+                "symbol": "SBUX",
+                "side": "sell_short",
+                "qty": "10",
+                "price": "100.00",
+                "order_id": "ord-1",
+                "order_status": "filled",
+                "transaction_time": "2024-01-02T15:00:00Z",
+            },
+            {
+                "activity_type": "FILL",
+                "id": "act-2",
+                "symbol": "SBUX",
+                "side": "buy",
+                "qty": "10",
+                "price": "90.00",
+                "order_id": "ord-2",
+                "order_status": "filled",
+                "transaction_time": "2024-01-03T15:00:00Z",
+            },
+        ]
+    )
+
+    operations, still_open = match_operations(fills)
+
+    assert len(operations) == 1
+    assert operations[0].direction == "SHORT"
+    assert operations[0].qty == pytest.approx(10.0)
+    assert operations[0].pnl == pytest.approx(100.0)
+    assert still_open == []
