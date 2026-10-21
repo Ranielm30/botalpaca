@@ -140,6 +140,38 @@ async def test_trade_events_recorded(database):
     assert len(events) >= 2
 
 
+async def test_a_close_request_is_journaled_with_the_keywords_the_journal_takes(database):
+    """The order goes out first and the journal is written after it.
+
+    So a journal call the gateway gets wrong does not roll the close back -- it
+    leaves the position closed and the operator staring at an unexpected error
+    instead of the confirmation.
+    """
+    from types import SimpleNamespace
+
+    from botalpaca.app import PositionGateway
+
+    journal = TradeJournal(database)
+    trade = await _open(journal, symbol="SBUX")
+
+    class _Engine:
+        async def close_position(self, symbol, **kwargs):
+            return SimpleNamespace(
+                order=SimpleNamespace(id="ord-1", filled_avg_price=96.5)
+            )
+
+    gateway = PositionGateway(
+        portfolio=None, engine=_Engine(), journal=journal, environment=PAPER
+    )
+
+    result = await gateway.close_position("SBUX", qty="59")
+
+    assert result.order.id == "ord-1"
+    async with database.session() as session:
+        events = await TradeRepository(session).events(trade.id, PAPER)
+    assert "CLOSE_REQUESTED" in [event.event_type for event in events]
+
+
 # -- learning -----------------------------------------------------------------------
 async def test_overall_stats_empty_environment(database):
     engine = StatisticalEngine(database)

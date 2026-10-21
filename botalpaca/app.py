@@ -191,9 +191,9 @@ class PositionGateway:
         )
         price = result.order.filled_avg_price if result.order else None
         await self._journal.add_event(
-            0,
-            self.environment,
-            "CLOSE_REQUESTED",
+            environment=self.environment,
+            symbol=symbol,
+            event_type="CLOSE_REQUESTED",
             note=f"close_position {symbol} qty={qty} pct={percentage} order={result.order.id if result.order else 'n/a'}",
         )
         log.info(
