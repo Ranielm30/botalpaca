@@ -108,6 +108,66 @@ async def _repair_ledger(settings: Settings, *, apply: bool) -> int:
     return 0
 
 
+async def _sync_positions(settings: Settings, *, apply: bool) -> int:
+    """Compare the open positions of the journal with the broker's, and fix them.
+
+    A row the broker sold while the journal kept it open makes the account
+    look heavier than it is, and the risk engine sizes the next trade with
+    that number. Without ``apply`` nothing is written and the command only
+    says what would change.
+    """
+    configure_logging(level=settings.log_level, json_output=settings.log_json)
+    from botalpaca.db import ProtectionRepository, TradeRepository
+    from botalpaca.execution.history import fetch_fills, match_operations
+    from botalpaca.journal.position_sync import (
+        apply_position_sync,
+        describe,
+        plan_position_sync,
+    )
+
+    app = Application(settings)
+    try:
+        await app.start()
+    except ConfigurationError as exc:
+        print(f"ERROR de configuración: {exc}", file=sys.stderr)
+        return 2
+    environment = app.active_environment
+    try:
+        fills = await fetch_fills(app.active.trading_client)
+        operations, still_open = match_operations(fills)
+        async with app.database.session() as session:
+            trades = TradeRepository(session)
+            rows = list(await trades.get_open_positions(environment))
+            all_rows = list(await trades.get_all(environment, limit=5000))
+            protection = {
+                str(row.symbol).upper(): {
+                    "stop_price": row.stop_price,
+                    "target_price": row.take_profit_price,
+                }
+                for row in await ProtectionRepository(session).all_for(environment)
+            }
+            plan = plan_position_sync(operations, rows, still_open, protection, all_rows)
+            print(f"Operaciones del broker: {len(operations)}")
+            print(f"Lotes abiertos del broker: {len(still_open)}")
+            print(f"Filas abiertas del diario: {len(rows)}")
+            for line in describe(plan):
+                print(line)
+            if not apply:
+                print("Nada escrito: vuelve con --apply para aplicar el plan.")
+                return 0
+            report = await apply_position_sync(session, plan, environment)
+            print(
+                f"Aplicado: {report.closed} filas cerradas, "
+                f"{report.updated} corregidas, "
+                f"{report.inserted} posiciones añadidas, "
+                f"{report.removed} duplicadas borradas, "
+                f"{report.days_rebuilt} días recalculados"
+            )
+    finally:
+        await app.stop()
+    return 0
+
+
 async def _run(settings: Settings) -> int:
     configure_logging(level=settings.log_level, json_output=settings.log_json)
     if not settings.telegram_enabled:
@@ -228,14 +288,19 @@ def main(argv: list[str] | None = None) -> int:
         action="store_true",
         help="with --repair-ledger: write the repair into the journal",
     )
+    parser.add_argument(
+        "--sync-positions",
+        action="store_true",
+        help="compare the open positions of the journal with the broker's and report",
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings()
     if args.log_level:
         settings = settings.model_copy(update={"log_level": args.log_level.upper()})
 
-    if args.apply and not args.repair_ledger:
-        print("ERROR: --apply sólo sirve junto a --repair-ledger", file=sys.stderr)
+    if args.apply and not (args.repair_ledger or args.sync_positions):
+        print("ERROR: --apply sólo sirve junto a --repair-ledger o --sync-positions", file=sys.stderr)
         return 2
 
     try:
@@ -243,6 +308,8 @@ def main(argv: list[str] | None = None) -> int:
             return asyncio.run(_check(settings))
         if args.repair_ledger:
             return asyncio.run(_repair_ledger(settings, apply=args.apply))
+        if args.sync_positions:
+            return asyncio.run(_sync_positions(settings, apply=args.apply))
         return asyncio.run(_run(settings))
     except ConfigurationError as exc:
         print(f"ERROR de configuración: {exc}", file=sys.stderr)
