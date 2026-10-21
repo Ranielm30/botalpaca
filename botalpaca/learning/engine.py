@@ -10,12 +10,14 @@ from __future__ import annotations
 import datetime as dt
 import math
 from collections.abc import Callable, Sequence
+from typing import Any
 
 from botalpaca.config import AnalyticsSettings, get_settings
 from botalpaca.config.logging import get_logger
 from botalpaca.db import Database, TradeRepository
 from botalpaca.db.models import TradeModel
 from botalpaca.domain import StatisticalSummary, SymbolStats, TradingEnvironment
+from botalpaca.journal.broker_repair import is_broker_import
 
 log = get_logger(__name__)
 
@@ -42,56 +44,69 @@ class StatisticalEngine:
     def settings(self) -> AnalyticsSettings:
         return self._settings
 
+    async def _closed_rows(
+        self, session: Any, environment: TradingEnvironment
+    ) -> list[Any]:
+        """The closed trades the bot planned itself.
+
+        A row imported from the broker's ledger is a trade the bot never
+        planned: it carries no strategy, no setup and no risk. Letting those
+        rows into the statistics would teach the engine from a strategy of its
+        own making, so they are left out of every group.
+        """
+        rows = list(await TradeRepository(session).get_closed(environment))
+        return [row for row in rows if not is_broker_import(row)]
+
     # ------------------------------------------------------------------ public
 
     async def overall(self, environment: TradingEnvironment) -> StatisticalSummary:
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         return self._summarize("GLOBAL", rows)
 
     async def by_strategy(self, environment: TradingEnvironment) -> dict[str, StatisticalSummary]:
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         return self._group(rows, lambda t: t.strategy)
 
     async def by_setup(self, environment: TradingEnvironment) -> dict[str, StatisticalSummary]:
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         return self._group(rows, lambda t: t.setup)
 
     async def by_timeframe(self, environment: TradingEnvironment) -> dict[str, StatisticalSummary]:
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         return self._group(rows, lambda t: t.timeframe)
 
     async def by_regime(self, environment: TradingEnvironment) -> dict[str, StatisticalSummary]:
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         return self._group(rows, lambda t: t.regime)
 
     async def by_sector(self, environment: TradingEnvironment) -> dict[str, StatisticalSummary]:
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         return self._group(rows, lambda t: t.sector or "UNKNOWN")
 
     async def by_symbol(self, environment: TradingEnvironment) -> dict[str, StatisticalSummary]:
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         return self._group(rows, lambda t: t.symbol)
 
     async def by_score_band(self, environment: TradingEnvironment) -> dict[str, StatisticalSummary]:
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         return self._group(rows, lambda t: _score_band(t.score))
 
     async def by_weekday(self, environment: TradingEnvironment) -> dict[str, StatisticalSummary]:
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         return self._group(rows, lambda t: _weekday(t.opened_at))
 
     async def by_hour(self, environment: TradingEnvironment) -> dict[str, StatisticalSummary]:
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         return self._group(rows, lambda t: _hour_bucket(t.opened_at))
 
     async def symbol_detail(
@@ -100,7 +115,7 @@ class StatisticalEngine:
         async with self._db.session() as session:
             rows = [
                 t
-                for t in await TradeRepository(session).get_closed(environment)
+                for t in await self._closed_rows(session, environment)
                 if t.symbol == symbol.upper()
             ]
         if not rows:
@@ -134,7 +149,7 @@ class StatisticalEngine:
     ) -> StatisticalSummary | None:
         """Stats for trades matching the same setup context (used by entry quality)."""
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         matching = [
             t
             for t in rows
@@ -151,7 +166,7 @@ class StatisticalEngine:
         """Non-binding suggestions. Never mutates settings."""
         out: list[str] = []
         async with self._db.session() as session:
-            rows = list(await TradeRepository(session).get_closed(environment))
+            rows = await self._closed_rows(session, environment)
         if len(rows) < self._settings.min_sample_for_significance:
             return [
                 f"Muestra insuficiente ({len(rows)} operaciones, mínimo "

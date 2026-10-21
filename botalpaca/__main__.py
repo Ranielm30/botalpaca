@@ -65,6 +65,49 @@ async def _check(settings: Settings) -> int:
     return 0
 
 
+async def _repair_ledger(settings: Settings, *, apply: bool) -> int:
+    """Compare the journal with the broker's fills, and optionally fix it.
+
+    The broker's ledger is the account of record: the journal is only right
+    when it agrees with it. Without ``apply`` nothing is written and the
+    command only says what would change.
+    """
+    configure_logging(level=settings.log_level, json_output=settings.log_json)
+    from botalpaca.db import TradeRepository
+    from botalpaca.execution.history import fetch_fills, match_operations
+    from botalpaca.journal.broker_repair import apply_plan, describe, plan_repairs
+
+    app = Application(settings)
+    try:
+        await app.start()
+    except ConfigurationError as exc:
+        print(f"ERROR de configuración: {exc}", file=sys.stderr)
+        return 2
+    environment = app.active_environment
+    try:
+        fills = await fetch_fills(app.active.trading_client)
+        operations, still_open = match_operations(fills)
+        async with app.database.session() as session:
+            rows = list(await TradeRepository(session).get_closed(environment))
+            plan = plan_repairs(operations, rows)
+            print(f"Operaciones del broker: {len(operations)}")
+            print(f"Filas cerradas del diario: {len(rows)}")
+            for line in describe(plan):
+                print(line)
+            if not apply:
+                print("Nada escrito: vuelve con --apply para aplicar el plan.")
+                return 0
+            report = await apply_plan(session, plan, environment)
+            print(
+                f"Aplicado: {report.fixed} filas corregidas, "
+                f"{report.inserted} importadas, "
+                f"{report.days_rebuilt} días recalculados"
+            )
+    finally:
+        await app.stop()
+    return 0
+
+
 async def _run(settings: Settings) -> int:
     configure_logging(level=settings.log_level, json_output=settings.log_json)
     if not settings.telegram_enabled:
@@ -175,15 +218,31 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--log-level", default=None, help="override LOG_LEVEL (DEBUG, INFO, WARNING, ERROR)"
     )
+    parser.add_argument(
+        "--repair-ledger",
+        action="store_true",
+        help="compare the journal with the broker's fills and report the difference",
+    )
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="with --repair-ledger: write the repair into the journal",
+    )
     args = parser.parse_args(argv)
 
     settings = get_settings()
     if args.log_level:
         settings = settings.model_copy(update={"log_level": args.log_level.upper()})
 
+    if args.apply and not args.repair_ledger:
+        print("ERROR: --apply sólo sirve junto a --repair-ledger", file=sys.stderr)
+        return 2
+
     try:
         if args.check:
             return asyncio.run(_check(settings))
+        if args.repair_ledger:
+            return asyncio.run(_repair_ledger(settings, apply=args.apply))
         return asyncio.run(_run(settings))
     except ConfigurationError as exc:
         print(f"ERROR de configuración: {exc}", file=sys.stderr)
