@@ -160,6 +160,63 @@ def _user_id(update: object) -> int | None:
     return int(user) if user is not None else None
 
 
+def _signed(value: float | None) -> str:
+    """A money amount with its sign in front of it."""
+    amount = value or 0.0
+    return f"{'+' if amount >= 0 else '-'}${abs(amount):,.2f}"
+
+
+def _render_broker_history(operations: list, open_lots: list) -> list[str]:
+    """The account as the broker measured it.
+
+    These numbers come from the fills Alpaca recorded, not from the bot's own
+    book: a position closed in several lots, an exit that only went through in
+    part and a trade the journal never wrote down all leave the two accounts
+    apart, and the operator is owed the one that adds up.
+    """
+    out = ["", "<b>Total cerrado (Alpaca)</b>"]
+    if not operations:
+        out.append("Sin operaciones cerradas todavía.")
+        return out
+    wins = sum(1 for operation in operations if operation.pnl > 0)
+    total = sum(operation.pnl for operation in operations)
+    out += [
+        f"P&L <b>{_signed(total)}</b> · "
+        f"{sum(operation.pnl_pct for operation in operations):+.2f}%",
+        f"✅ {wins} ganancias · ❌ {len(operations) - wins} pérdidas · "
+        f"acierto {wins / len(operations) * 100:.0f}%",
+        f"{len(operations)} operaciones · {len({lot.symbol for lot in open_lots})} abiertas",
+    ]
+    with_r = [operation for operation in operations if operation.r_multiple is not None]
+    if with_r:
+        out.append(f"R acumulado {sum(op.r_multiple for op in with_r):+.2f}R")
+    recent = sorted(operations, key=lambda operation: operation.closed_at, reverse=True)[:10]
+    if recent:
+        out.append("")
+        out.append("<b>Últimas 10</b>")
+    for operation in recent:
+        out.append(
+            f"<code>{operation.closed_at:%d-%m %H:%M}</code> "
+            f"<b>{operation.symbol}</b> · {operation.direction}"
+        )
+        r_text = (
+            f"{operation.r_multiple:+.2f}R" if operation.r_multiple is not None else "sin R"
+        )
+        if operation.exit_reason:
+            reason = operation.exit_reason
+        elif operation.registered:
+            reason = "sin motivo"
+        else:
+            reason = "sin registrar"
+        out.append(
+            f"  {_signed(operation.pnl)} · {operation.pnl_pct:+.2f}% · {r_text} · {reason}"
+        )
+    orphans = [operation for operation in operations if not operation.registered]
+    if orphans:
+        out += ["", f"<i>{len(orphans)} operaciones sin registrar en el diario del bot.</i>"]
+    return out
+
+
 class TelegramFacade:
     """All command logic, independent of the Telegram library.
 
@@ -1528,24 +1585,44 @@ class TelegramFacade:
         lines += ["", "<i>Las muestras pequeñas no son estadísticamente significativas.</i>"]
         return CommandResult("\n".join(lines))
 
+    async def _broker_history(self) -> tuple[list, list] | None:
+        """Ask the broker what really traded, or give up quietly.
+
+        The history is worth more with the broker's ledger than without it, but
+        it is not worth failing over: when the broker cannot be reached the
+        journal answers on its own.
+        """
+        client = getattr(getattr(self.app, "active", None), "trading_client", None)
+        if client is None:
+            return None
+        from botalpaca.execution.history import fetch_fills, match_operations
+
+        try:
+            fills = await fetch_fills(client)
+        except Exception as exc:  # noqa: BLE001 - the journal can answer too
+            log.warning("telegram.broker_history_unavailable", error=str(exc))
+            return None
+        if not fills:
+            return None
+        return match_operations(fills)
+
     async def historial(self, update: object, args: str | None = None) -> CommandResult:
         """Closed operations, plus the total they add up to.
 
-        The command used to answer with a flat list of dense lines and no
-        summary at all, so the one question it is asked most often ("how much
-        am I up?") had to be answered by hand. Entries Alpaca never executed
-        come back from the journal as CLOSED with a zero P&L; they are not
-        trades, so they stay out of the sums and out of the count, and are
-        only noted at the bottom where they belong.
+        The numbers come from the broker's own ledger of fills: it is the only
+        place where the real profit of the account lives. The journal keeps
+        the bot's side of the story -- the strategy, the exit reason, the R
+        multiple -- and hangs it on the operations it can describe. When the
+        broker cannot be reached the journal answers on its own.
+
+        Entries Alpaca never executed come back from the journal as CLOSED
+        with a zero P&L; they are not trades, so they stay out of the sums and
+        out of the count, and are only noted at the bottom where they belong.
         """
         await self.authorize(update)
         environment = self.environment
         symbols = parse_symbol_list(args)
         from botalpaca.db import TradeRepository
-
-        def signed(value: float | None) -> str:
-            amount = value or 0.0
-            return f"{'+' if amount >= 0 else '-'}${abs(amount):,.2f}"
 
         def block(closed: list, skipped: int, open_count: int) -> list[str]:
             out = ["", "<b>Total cerrado</b>"]
@@ -1554,7 +1631,7 @@ class TelegramFacade:
                 return out
             wins = sum(1 for trade in closed if (trade.pnl or 0.0) > 0)
             out += [
-                f"P&L <b>{signed(sum((trade.pnl or 0.0) for trade in closed))}</b>"
+                f"P&L <b>{_signed(sum((trade.pnl or 0.0) for trade in closed))}</b>"
                 f" · {sum((trade.pnl_pct or 0.0) for trade in closed):+.2f}%",
                 f"✅ {wins} ganancias · ❌ {len(closed) - wins} pérdidas · "
                 f"acierto {wins / len(closed) * 100:.0f}%",
@@ -1575,7 +1652,7 @@ class TelegramFacade:
                     f"<b>{trade.symbol}</b> · {trade.direction}"
                 )
                 out.append(
-                    f"  {signed(trade.pnl)} · {(trade.pnl_pct or 0.0):+.2f}% · "
+                    f"  {_signed(trade.pnl)} · {(trade.pnl_pct or 0.0):+.2f}% · "
                     f"{(trade.r_multiple or 0.0):+.2f}R · {trade.exit_reason or 'sin motivo'}"
                 )
             if skipped:
@@ -1587,33 +1664,50 @@ class TelegramFacade:
             return counted, len(rows) - len(counted)
 
         lines = [f"{env_badge(environment)} · <b>Historial</b>"]
+        broker = await self._broker_history()
         async with self.app.database.session() as session:
             repo = TradeRepository(session)
-            for symbol in symbols:
-                # The symbol view is the only one that still mixes open and
-                # closed rows, so it reads them in one go and splits by hand.
-                rows = list(await repo.get_all(environment, symbol=symbol, limit=500))
-                if not rows:
-                    lines += ["", f"<b>{symbol}</b>", "Sin operaciones registradas."]
-                    continue
-                counted, skipped = live([row for row in rows if row.status == "CLOSED"])
-                open_count = sum(1 for row in rows if row.status == "OPEN")
-                lines += ["", f"<b>{symbol}</b>"]
-                lines += block(counted, skipped, open_count)
-            if not symbols:
-                # `limit` is keyword-only in get_closed; a positional 15 here
-                # raises TypeError, which is why `/historial` with no symbols
-                # (the way it is typed most of the time) never answered.
-                counted, skipped = live(list(await repo.get_closed(environment)))
-                # Counted off `get_all` instead of `count_open`: the open rows
-                # are wanted next to the closed ones anyway, and one query is
-                # cheaper than the aggregate.
-                still_open = sum(
-                    1
-                    for row in await repo.get_all(environment, limit=500)
-                    if row.status == "OPEN"
-                )
-                lines += block(counted, skipped, still_open)
+            if broker is not None:
+                # The broker's ledger is the account of record; the journal
+                # only adds the bot's own notes to the operations it knows.
+                from botalpaca.execution.history import match_rows
+
+                operations, open_lots = broker
+                match_rows(operations, list(await repo.get_closed(environment)))
+                for symbol in symbols:
+                    lines += ["", f"<b>{symbol}</b>"]
+                    lines += _render_broker_history(
+                        [op for op in operations if op.symbol == symbol],
+                        [lot for lot in open_lots if lot.symbol == symbol],
+                    )
+                if not symbols:
+                    lines += _render_broker_history(operations, open_lots)
+            else:
+                for symbol in symbols:
+                    # The symbol view is the only one that still mixes open and
+                    # closed rows, so it reads them in one go and splits by hand.
+                    rows = list(await repo.get_all(environment, symbol=symbol, limit=500))
+                    if not rows:
+                        lines += ["", f"<b>{symbol}</b>", "Sin operaciones registradas."]
+                        continue
+                    counted, skipped = live([row for row in rows if row.status == "CLOSED"])
+                    open_count = sum(1 for row in rows if row.status == "OPEN")
+                    lines += ["", f"<b>{symbol}</b>"]
+                    lines += block(counted, skipped, open_count)
+                if not symbols:
+                    # `limit` is keyword-only in get_closed; a positional 15 here
+                    # raises TypeError, which is why `/historial` with no symbols
+                    # (the way it is typed most of the time) never answered.
+                    counted, skipped = live(list(await repo.get_closed(environment)))
+                    # Counted off `get_all` instead of `count_open`: the open rows
+                    # are wanted next to the closed ones anyway, and one query is
+                    # cheaper than the aggregate.
+                    still_open = sum(
+                        1
+                        for row in await repo.get_all(environment, limit=500)
+                        if row.status == "OPEN"
+                    )
+                    lines += block(counted, skipped, still_open)
         lines += ["", "<i>Escribe /historial SIMBOLO para ver una sola.</i>"]
         return CommandResult("\n".join(lines))
 

@@ -214,6 +214,39 @@ class AlpacaTradingClient:
         )
         return list(await self._run(self.raw.get_orders, request))
 
+    async def get_activities(
+        self,
+        *,
+        activity_types: str = "FILL",
+        direction: str = "asc",
+        page_size: int = 100,
+        after: str | None = None,
+        until: str | None = None,
+        page_token: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Read the account's activities, one page at a time.
+
+        The typed client of alpaca-py does not expose the account activities
+        endpoint, but the REST client it inherits is public, and that endpoint
+        is the only place where the fills of the account live -- which makes
+        it the only place where the real profit of the account can be read.
+        """
+        params: dict[str, Any] = {
+            "activity_types": activity_types,
+            "direction": direction,
+            "page_size": page_size,
+        }
+        if after:
+            params["after"] = after
+        if until:
+            params["until"] = until
+        if page_token:
+            params["page_token"] = page_token
+        payload = await self._run(self.raw.get, "/account/activities", params)
+        if isinstance(payload, list):
+            return [item for item in payload if isinstance(item, dict)]
+        return []
+
     async def get_order_for_symbol(self, symbol: str) -> Order | None:
         orders = await self.get_orders(status=QueryOrderStatus.OPEN, symbols=[symbol.upper()])
         return orders[0] if orders else None
