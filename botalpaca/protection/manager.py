@@ -1824,7 +1824,29 @@ class PositionProtectionManager:
     async def time_stop_deadline(
         self, environment: TradingEnvironment, symbol: str
     ) -> dt.datetime | None:
+        # The journal keeps one deadline per trade, while the protection row
+        # keeps only one per symbol. When a symbol carries several open
+        # positions the protection row reflects only the most recent entry and
+        # the older ones never trigger their time stop. Read the trades first,
+        # so the oldest open position is the one that fires.
         async with self._db.session() as session:
+            from sqlalchemy import select
+
+            from botalpaca.db import TradeModel
+            from botalpaca.domain import TradeStatus
+
+            stmt = select(TradeModel.time_stop_at).where(
+                TradeModel.environment == environment.value,
+                TradeModel.symbol == symbol.upper(),
+                TradeModel.status == TradeStatus.OPEN.value,
+            )
+            rows = (await session.execute(stmt)).scalars().all()
+            deadlines = [d for d in rows if d is not None]
+            if deadlines:
+                return min(
+                    deadlines,
+                    key=lambda d: d if d.tzinfo is not None else d.replace(tzinfo=dt.UTC),
+                )
             row = await ProtectionRepository(session).get(environment, symbol)
         return row.time_stop_at if row is not None else None
 

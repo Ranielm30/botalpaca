@@ -7,7 +7,9 @@ import datetime as dt
 import pytest
 from alpaca.trading.enums import OrderClass
 
-from botalpaca.db.repositories import ProtectionRepository
+from botalpaca.db.models import TradeModel
+from botalpaca.db.repositories import ProtectionRepository, TradeRepository
+from botalpaca.domain import TradeStatus
 from botalpaca.domain.enums import ProtectionKind, TimeInForce, TradingEnvironment
 from botalpaca.domain.errors import OrderRejectedByBrokerError, ValidationError
 from botalpaca.execution.client import BrokerError
@@ -1493,3 +1495,36 @@ async def test_a_stop_that_would_cross_the_target_is_pulled_back(database):
     assert request.take_profit is not None
     assert request.stop_loss is not None
     assert request.stop_loss.stop_price < request.take_profit.limit_price, notes
+
+
+async def test_a_time_stop_fires_for_the_oldest_open_trade(database):
+    # The protection row keeps only one deadline per symbol, so a symbol that
+    # carries several open positions would never time-stop the older ones. The
+    # deadline has to come from the journal, where every trade keeps its own.
+    manager, _, client = await _setup(database)
+
+    # The protection row says "not yet": its deadline is an hour from now.
+    await manager.register_entry_protection(
+        environment=PAPER, symbol="AAPL", qty=10, entry_price=100.0,
+        time_stop_minutes=60,
+    )
+
+    # But the journal already holds an older, expired trade for the same symbol.
+    async with database.session() as session:
+        session.add(
+            TradeModel(
+                environment=PAPER.value,
+                symbol="AAPL",
+                direction="LONG",
+                strategy="momentum",
+                setup="breakout",
+                status=TradeStatus.OPEN.value,
+                qty=10.0,
+                entry_price=100.0,
+                opened_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=3),
+                time_stop_at=dt.datetime.now(dt.UTC) - dt.timedelta(hours=1),
+            )
+        )
+        await session.commit()
+
+    assert await manager.is_time_stop_due(PAPER, "AAPL") is True
