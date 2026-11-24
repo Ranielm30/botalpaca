@@ -60,7 +60,7 @@ def _plan(*, entry=100.0, stop=95.0, target=110.0, atr=2.0, long=True) -> TradeP
         stop_loss=stop,
         take_profit=target,
         atr=atr,
-        rr=2.0,
+        rr=3.0,
     )
 
 
@@ -178,8 +178,8 @@ def _opportunity(**kw):
         direction=SignalDirection.LONG,
         entry=100.0,
         stop=95.0,
-        target=110.0,
-        rr=2.0,
+        target=115.0,
+        rr=3.0,
         score=70.0,
     )
     defaults.update(kw)

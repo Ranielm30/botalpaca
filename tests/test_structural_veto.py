@@ -44,7 +44,7 @@ class _Snapshot:
         )
 
 
-def _long(*, entry=100.0, stop=95.0, target=110.0, score=92.0):
+def _long(*, entry=100.0, stop=95.0, target=112.5, score=92.0):
     return make_opportunity(
         symbol="AAPL",
         environment=PAPER,
@@ -57,7 +57,7 @@ def _long(*, entry=100.0, stop=95.0, target=110.0, score=92.0):
     )
 
 
-def _short(*, entry=100.0, stop=105.0, target=90.0, score=92.0):
+def _short(*, entry=100.0, stop=105.0, target=87.5, score=92.0):
     return make_opportunity(
         symbol="AAPL",
         environment=PAPER,
@@ -102,8 +102,8 @@ def test_a_short_whose_target_sits_below_a_support_is_refused():
 
 
 def test_a_long_whose_target_is_below_the_resistance_passes():
-    """Target at 110, resistance at 118: nothing has to be broken."""
-    opp = _long(entry=100.0, stop=95.0, target=110.0)
+    """Target at 112.5, resistance at 118: nothing has to be broken."""
+    opp = _long(entry=100.0, stop=95.0, target=112.5)
     engine = _engine()
     engine._apply_tradability(opp, _Snapshot(resistances=[(118.0, 3)]), environment=PAPER)
     assert opp.tradable is True
@@ -127,7 +127,7 @@ def test_a_chart_with_no_levels_at_all_is_not_blocked():
 
 def test_a_resistance_behind_the_entry_does_not_block():
     """Only what stands between the entry and the target matters."""
-    opp = _long(entry=100.0, stop=95.0, target=110.0)
+    opp = _long(entry=100.0, stop=95.0, target=112.5)
     engine = _engine()
     engine._apply_tradability(opp, _Snapshot(resistances=[(97.0, 3)]), environment=PAPER)
     assert opp.tradable is True

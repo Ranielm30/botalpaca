@@ -59,7 +59,7 @@ QUALITY_THRESHOLDS: tuple[tuple[float, Quality], ...] = (
 # the operator can loosen it without a code change: at 70 nothing qualified, and
 # a bot that never opens a position cannot be evaluated at all.
 MIN_EXECUTABLE_SCORE = 60.0
-MIN_RR = 2.0
+MIN_RR = 2.5
 MIN_DATA_QUALITY = 0.5
 
 

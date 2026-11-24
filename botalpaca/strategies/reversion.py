@@ -80,7 +80,7 @@ class MeanReversionStrategy(BaseStrategy):
         # Reversion targets the mean, which caps reward; keep R:R modest.
         target = i.bb_middle
         levels = TradeLevels(direction=direction, entry=i.close, stop=stop, targets=(target,))
-        if levels.rr < 1.0:
+        if levels.rr < 1.5:
             return None
         return self._build_signal(
             snapshot,
@@ -203,7 +203,7 @@ class VwapReversionStrategy(BaseStrategy):
         )
         stop = i.close - direction_sign(direction) * 1.3 * atr
         levels = TradeLevels(direction=direction, entry=i.close, stop=stop, targets=(vwap,))
-        if levels.rr < 1.0:
+        if levels.rr < 1.5:
             return None
         return self._build_signal(
             snapshot,
